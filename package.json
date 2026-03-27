@@ -1,8 +1,28 @@
 {
-  "name": "azure-mcp",
+  "name": "azure-board-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for Azure DevOps Boards (work items). Stdio transport; requires Bun.",
+  "mcpName": "io.github.broisnischal/azure-mcp",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/broisnischal/azure-mcp.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "azure-devops",
+    "azure-boards"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  },
   "module": "index.ts",
   "type": "module",
-  "private": true,
+  "files": [
+    "src",
+    "README.md"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest"
   },

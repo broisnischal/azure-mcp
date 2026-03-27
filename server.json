@@ -1,0 +1,45 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.broisnischal/azure-mcp",
+  "title": "Azure Boards MCP",
+  "description": "Azure DevOps Boards work items over MCP (stdio). Requires Bun, org, project, and PAT.",
+  "repository": {
+    "url": "https://github.com/broisnischal/azure-mcp",
+    "source": "github"
+  },
+  "version": "1.0.0",
+  "websiteUrl": "https://github.com/broisnischal/azure-mcp",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "azure-board-mcp",
+      "version": "1.0.0",
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
+        {
+          "name": "AZURE_ORG",
+          "description": "Azure DevOps organization name",
+          "format": "string",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "AZURE_PROJECT",
+          "description": "Azure DevOps project name",
+          "format": "string",
+          "isRequired": true,
+          "isSecret": false
+        },
+        {
+          "name": "AZURE_PAT",
+          "description": "Personal access token (Work Items: Read & Write)",
+          "format": "string",
+          "isRequired": true,
+          "isSecret": true
+        }
+      ]
+    }
+  ]
+}
