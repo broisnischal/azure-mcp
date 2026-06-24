@@ -11,20 +11,21 @@ Installable via `npx` or `bunx` — no clone required.
 ## Install & authenticate
 
 ```bash
-# Step 1 — authenticate (PAT, no app registration needed)
+# OAuth — opens browser for Microsoft sign-in (default, no setup needed)
 npx azure-board-mcp authenticate
 
-# OR — OAuth device code (requires AZURE_CLIENT_ID env var)
-npx azure-board-mcp authenticate --oauth
+# PAT — for CI or environments where browser sign-in isn't available
+npx azure-board-mcp authenticate --pat
 
-# Verify
+# Verify stored credentials
 npx azure-board-mcp check
 
 # Logout
 npx azure-board-mcp logout
 ```
 
-The PAT wizard prompts for org, project, and token, validates them, then stores credentials at `~/.azure-mcp-auth.json`.
+Both flows fetch all available projects after sign-in and let you pick from a numbered list — no typing project names.  
+Credentials are stored at `~/.azure-mcp-auth.json`.
 
 **PAT required scopes:** Work Items (Read & Write) · Build (Read) · Code (Read)  
 Create at: `https://dev.azure.com/{org}/_usersSettings/tokens`

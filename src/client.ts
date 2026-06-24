@@ -391,6 +391,29 @@ export class AzureDevOpsClient {
     this.cache = new Cache();
   }
 
+  get org(): string { return this.cfg.org; }
+  get project(): string | undefined { return this.cfg.project; }
+
+  /** Throws a friendly error if no project has been selected yet. */
+  private requireProject(): string {
+    if (!this.cfg.project) {
+      throw new Error(
+        "No project selected. Call switch_project to pick one from your org.",
+      );
+    }
+    return this.cfg.project;
+  }
+
+  /** Persist a newly selected project into the stored auth file. */
+  async setProject(project: string): Promise<void> {
+    const { writeFile } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const authFile = join(process.env["HOME"] ?? "~", ".azure-mcp-auth.json");
+    this.cfg.project = project;
+    await writeFile(authFile, JSON.stringify(this.cfg, null, 2), { mode: 0o600 });
+    this.cache.invalidate(); // stale project context
+  }
+
   // ── HTTP primitives ────────────────────────────────────────────────────────
 
   private async get<T>(url: string): Promise<T> {
@@ -447,15 +470,15 @@ export class AzureDevOpsClient {
     }
   }
 
-  // URL builders
+  // URL builders — all call requireProject() so callers don't need to
   private apis(path: string) {
-    return `${this.base}/${this.cfg.project}/_apis/${path}`;
+    return `${this.base}/${this.requireProject()}/_apis/${path}`;
   }
   private tapis(team: string, path: string) {
-    return `${this.base}/${this.cfg.project}/${encodeURIComponent(team)}/_apis/${path}`;
+    return `${this.base}/${this.requireProject()}/${encodeURIComponent(team)}/_apis/${path}`;
   }
   private rmapis(path: string) {
-    return `${this.vsrmBase}/${this.cfg.project}/_apis/${path}`;
+    return `${this.vsrmBase}/${this.requireProject()}/_apis/${path}`;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -471,9 +494,10 @@ export class AzureDevOpsClient {
   }
 
   async getProjectInfo(): Promise<ProjectInfo> {
-    return this.cache.getOrFetch(`project:${this.cfg.project}`, TTL.PROJECT, () =>
+    const p = this.requireProject();
+    return this.cache.getOrFetch(`project:${p}`, TTL.PROJECT, () =>
       this.get<ProjectInfo>(
-        `${this.base}/_apis/projects/${encodeURIComponent(this.cfg.project)}?includeCapabilities=true&api-version=7.1`,
+        `${this.base}/_apis/projects/${encodeURIComponent(p)}?includeCapabilities=true&api-version=7.1`,
       ),
     );
   }
@@ -536,7 +560,7 @@ export class AzureDevOpsClient {
       probe("profile", () => this.getMyProfile()),
       probe("workItems", () =>
         this.queryWiql(
-          `SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${this.cfg.project}'`,
+          `SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${this.requireProject()}'`,
         ),
       ),
       probe("builds", () => this.listPipelines()),
@@ -931,18 +955,20 @@ export class AzureDevOpsClient {
   // ═══════════════════════════════════════════════════════════════════════════
 
   async listTeams(): Promise<Team[]> {
-    return this.cache.getOrFetch(`teams:${this.cfg.project}`, TTL.TEAMS, async () => {
+    const project = this.requireProject();
+    return this.cache.getOrFetch(`teams:${project}`, TTL.TEAMS, async () => {
       const res = await this.get<{ value: Team[] }>(
-        `${this.base}/_apis/projects/${encodeURIComponent(this.cfg.project)}/teams?api-version=7.1`,
+        `${this.base}/_apis/projects/${encodeURIComponent(project)}/teams?api-version=7.1`,
       );
       return res.value;
     });
   }
 
   async getTeamMembers(team: string): Promise<TeamMember[]> {
+    const project = this.requireProject();
     const t = encodeURIComponent(team);
     const res = await this.get<{ value: TeamMember[] }>(
-      `${this.base}/_apis/projects/${encodeURIComponent(this.cfg.project)}/teams/${t}/members?api-version=7.1`,
+      `${this.base}/_apis/projects/${encodeURIComponent(project)}/teams/${t}/members?api-version=7.1`,
     );
     return res.value;
   }
@@ -1157,10 +1183,77 @@ export class AzureDevOpsClient {
 
   async getPullRequest(repoId: string, prId: number): Promise<PullRequest> {
     return this.get<PullRequest>(
-      this.apis(
-        `git/repositories/${repoId}/pullrequests/${prId}?api-version=7.1`,
-      ),
+      this.apis(`git/repositories/${repoId}/pullrequests/${prId}?api-version=7.1`),
     );
+  }
+
+  async createPullRequest(opts: {
+    repoId: string;
+    title: string;
+    sourceBranch: string;
+    targetBranch: string;
+    description?: string;
+    reviewers?: string[];
+    isDraft?: boolean;
+    workItemIds?: number[];
+  }): Promise<PullRequest> {
+    const body: Record<string, unknown> = {
+      title: opts.title,
+      sourceRefName: opts.sourceBranch.startsWith("refs/") ? opts.sourceBranch : `refs/heads/${opts.sourceBranch}`,
+      targetRefName: opts.targetBranch.startsWith("refs/") ? opts.targetBranch : `refs/heads/${opts.targetBranch}`,
+      isDraft: opts.isDraft ?? false,
+    };
+    if (opts.description) body["description"] = opts.description;
+    if (opts.reviewers?.length) body["reviewers"] = opts.reviewers.map((id) => ({ id }));
+    if (opts.workItemIds?.length) {
+      body["workItemRefs"] = opts.workItemIds.map((id) => ({
+        id: String(id),
+        url: this.apis(`wit/workItems/${id}`),
+      }));
+    }
+    return this.post<PullRequest>(
+      this.apis(`git/repositories/${opts.repoId}/pullrequests?api-version=7.1`),
+      body,
+    );
+  }
+
+  async getFileContent(
+    repoId: string,
+    path: string,
+    branch?: string,
+  ): Promise<{ content: string; isBinary: boolean; path: string; commitId: string }> {
+    const p = new URLSearchParams({
+      path,
+      "api-version": "7.1",
+      "$format": "text",
+    });
+    if (branch) p.set("versionDescriptor.version", branch);
+    const res = await fetch(this.apis(`git/repositories/${repoId}/items?${p}`), {
+      headers: { ...this.headers, Accept: "text/plain" },
+    });
+    if (!res.ok) throw new Error(`GET file "${path}" → ${res.status}: ${await res.text()}`);
+    const commitId = res.headers.get("x-ms-gitcommitid") ?? "";
+    const contentType = res.headers.get("content-type") ?? "";
+    const isBinary = !contentType.includes("text") && !path.match(/\.(ts|tsx|js|jsx|json|md|yml|yaml|css|html|xml|sh|py|go|rs|rb|java|cs|cpp|c|h|txt|env|gitignore|dockerfile)$/i);
+    const content = isBinary ? "[binary file — cannot display]" : await res.text();
+    return { content, isBinary, path, commitId };
+  }
+
+  async listFiles(
+    repoId: string,
+    path = "/",
+    branch?: string,
+  ): Promise<Array<{ path: string; isFolder: boolean; size?: number }>> {
+    const p = new URLSearchParams({
+      scopePath: path,
+      recursionLevel: "oneLevel",
+      "api-version": "7.1",
+    });
+    if (branch) p.set("versionDescriptor.version", branch);
+    const res = await this.get<{
+      value: Array<{ path: string; isFolder: boolean; size?: number }>;
+    }>(this.apis(`git/repositories/${repoId}/items?${p}`));
+    return res.value.filter((f) => f.path !== path);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

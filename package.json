@@ -1,6 +1,6 @@
 {
   "name": "azure-board-mcp",
-  "version": "1.1.0",
+  "version": "1.4.0",
   "description": "MCP server for Azure DevOps — work items, builds, and PRs. Installable via npx/bunx with OAuth or PAT auth.",
   "mcpName": "io.github.broisnischal/azure-mcp",
   "license": "MIT",
@@ -29,7 +29,6 @@
     "README.md"
   ],
   "dependencies": {
-    "@azure/msal-node": "^2.16.2",
     "@modelcontextprotocol/sdk": "latest"
   },
   "devDependencies": {
@@ -38,10 +37,18 @@
   },
   "scripts": {
     "dev": "bun run src/index.ts",
-    "start": "bun run src/index.ts",
+    "start": "node dist/index.js",
     "build": "bun build src/index.ts --outfile dist/index.js --target node",
     "lint": "bunx tsc --noEmit",
     "prepublishOnly": "bun run build",
-    "publish:npm": "npm publish --access public"
+    "publish:npm": "npm publish --access public",
+
+    "auth": "node dist/index.js authenticate",
+    "auth:pat": "node dist/index.js authenticate --pat",
+    "auth:check": "node dist/index.js check",
+    "auth:logout": "node dist/index.js logout",
+
+    "link": "bun run build && npm link",
+    "unlink": "npm unlink -g azure-board-mcp"
   }
 }
