@@ -688,8 +688,8 @@ export class AzureDevOpsClient {
   }
 
   async getWorkItem(id: number): Promise<WorkItem> {
-    return this.get<WorkItem>(
-      this.apis(`wit/workitems/${id}?$expand=all&api-version=7.1`),
+    return this.cache.getOrFetch(`wi:${id}`, TTL.WI, () =>
+      this.get<WorkItem>(this.apis(`wit/workitems/${id}?$expand=all&api-version=7.1`)),
     );
   }
 
@@ -799,12 +799,12 @@ export class AzureDevOpsClient {
   // ── Comments ───────────────────────────────────────────────────────────────
 
   async listComments(workItemId: number): Promise<WorkItemComment[]> {
-    const res = await this.get<{ comments: WorkItemComment[] }>(
-      this.apis(
-        `wit/workItems/${workItemId}/comments?api-version=7.1-preview.3`,
-      ),
-    );
-    return res.comments;
+    return this.cache.getOrFetch(`wi-comments:${workItemId}`, TTL.WI, async () => {
+      const res = await this.get<{ comments: WorkItemComment[] }>(
+        this.apis(`wit/workItems/${workItemId}/comments?api-version=7.1-preview.3`),
+      );
+      return res.comments;
+    });
   }
 
   async addComment(workItemId: number, text: string): Promise<WorkItemComment> {
@@ -978,10 +978,12 @@ export class AzureDevOpsClient {
   // ═══════════════════════════════════════════════════════════════════════════
 
   async listIterations(team: string): Promise<Iteration[]> {
-    const res = await this.get<{ value: Iteration[] }>(
-      this.tapis(team, "work/teamsettings/iterations?api-version=7.1"),
-    );
-    return res.value;
+    return this.cache.getOrFetch(`iters:${this.cfg.project}:${team}`, TTL.ITERS, async () => {
+      const res = await this.get<{ value: Iteration[] }>(
+        this.tapis(team, "work/teamsettings/iterations?api-version=7.1"),
+      );
+      return res.value;
+    });
   }
 
   async getCurrentIteration(team: string): Promise<Iteration | null> {
@@ -1134,10 +1136,12 @@ export class AzureDevOpsClient {
   // ═══════════════════════════════════════════════════════════════════════════
 
   async listRepositories(): Promise<Repository[]> {
-    const res = await this.get<{ value: Repository[] }>(
-      this.apis("git/repositories?api-version=7.1"),
-    );
-    return res.value;
+    return this.cache.getOrFetch(`repos:${this.cfg.project}`, TTL.REPOS, async () => {
+      const res = await this.get<{ value: Repository[] }>(
+        this.apis("git/repositories?api-version=7.1"),
+      );
+      return res.value;
+    });
   }
 
   async getRepository(repoId: string): Promise<Repository> {

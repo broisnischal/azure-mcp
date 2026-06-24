@@ -60,65 +60,71 @@ function extractImageUrls(html: string, max = 8): string[] {
   return urls;
 }
 
-// Compact summary used in list views
+// Compact one-line summary used in list views
 function fmtWI(wi: WorkItem): string {
   const f = wi.fields;
-  const assigned =
-    (f["System.AssignedTo"] as { displayName?: string } | undefined)?.displayName ?? "Unassigned";
-  const lines = [
-    `#${wi.id} — ${f["System.Title"]}`,
-    `  Type:     ${f["System.WorkItemType"]}`,
-    `  State:    ${f["System.State"]}`,
-    `  Priority: ${f["Microsoft.VSTS.Common.Priority"] ?? "—"}`,
-    `  Assigned: ${assigned}`,
-    `  Sprint:   ${f["System.IterationPath"] ?? "—"}`,
-    `  Pts:      ${f["Microsoft.VSTS.Scheduling.StoryPoints"] ?? "—"}`,
-    `  Tags:     ${String(f["System.Tags"] || "—")}`,
-    `  Updated:  ${f["System.ChangedDate"]}`,
-  ];
-  return lines.join("\n");
+  const assigned = (f["System.AssignedTo"] as { displayName?: string } | undefined)?.displayName ?? "—";
+  const sprint = String(f["System.IterationPath"] ?? "").split("\\").pop() ?? "—";
+  const pts = f["Microsoft.VSTS.Scheduling.StoryPoints"];
+  const pri = f["Microsoft.VSTS.Common.Priority"];
+  const meta = [
+    assigned !== "—" ? `@${assigned}` : null,
+    sprint !== "—" ? sprint : null,
+    pts != null ? `${pts}pts` : null,
+    pri != null ? `P${pri}` : null,
+  ].filter(Boolean).join(" · ");
+  return `#${wi.id} [${f["System.WorkItemType"]}/${f["System.State"]}] ${f["System.Title"]}${meta ? `  — ${meta}` : ""}`;
+}
+
+const TRUNC = 800; // max chars for long text fields
+
+function trunc(text: string): string {
+  return text.length > TRUNC ? text.slice(0, TRUNC) + `\n…(${text.length - TRUNC} more chars)` : text;
 }
 
 // Full detail view — used by get_work_item
 function fmtWIFull(wi: WorkItem, comments: Array<{ createdBy: { displayName: string }; createdDate: string; text: string }>): string {
   const f = wi.fields;
   const dn = (key: string) =>
-    (f[key] as { displayName?: string } | undefined)?.displayName ?? "—";
+    (f[key] as { displayName?: string } | undefined)?.displayName ?? "";
 
   const section = (title: string, body: string) =>
     body.trim() ? `\n## ${title}\n${body.trim()}` : "";
 
-  // ── Core fields ────────────────────────────────────────────────────────────
+  // Only include non-empty core fields
+  const row = (label: string, val: unknown) =>
+    val != null && val !== "" && val !== 0 ? `${label}: ${val}` : "";
+
   const core = [
     `# #${wi.id} — ${f["System.Title"]}`,
     ``,
-    `Type:           ${f["System.WorkItemType"]}`,
-    `State:          ${f["System.State"]}`,
-    `Priority:       ${f["Microsoft.VSTS.Common.Priority"] ?? "—"}`,
-    `Assigned to:    ${dn("System.AssignedTo")}`,
-    `Area:           ${f["System.AreaPath"] ?? "—"}`,
-    `Sprint:         ${f["System.IterationPath"] ?? "—"}`,
-    `Tags:           ${String(f["System.Tags"] || "—")}`,
-    `Story points:   ${f["Microsoft.VSTS.Scheduling.StoryPoints"] ?? "—"}`,
-    `Remaining work: ${f["Microsoft.VSTS.Scheduling.RemainingWork"] ?? "—"} h`,
-    `Original est.:  ${f["Microsoft.VSTS.Scheduling.OriginalEstimate"] ?? "—"} h`,
-    `Completed work: ${f["Microsoft.VSTS.Scheduling.CompletedWork"] ?? "—"} h`,
-    `Created by:     ${dn("System.CreatedBy")}  on  ${String(f["System.CreatedDate"] ?? "—").slice(0, 16)}`,
-    `Last changed:   ${dn("System.ChangedBy")}  on  ${String(f["System.ChangedDate"] ?? "—").slice(0, 16)}`,
-  ].join("\n");
+    row("Type",    f["System.WorkItemType"]),
+    row("State",   f["System.State"]),
+    row("Priority", f["Microsoft.VSTS.Common.Priority"]),
+    row("Assigned", dn("System.AssignedTo")),
+    row("Area",    f["System.AreaPath"]),
+    row("Sprint",  f["System.IterationPath"]),
+    row("Tags",    f["System.Tags"]),
+    row("Points",  f["Microsoft.VSTS.Scheduling.StoryPoints"]),
+    row("Remaining", f["Microsoft.VSTS.Scheduling.RemainingWork"] != null ? `${f["Microsoft.VSTS.Scheduling.RemainingWork"]}h` : null),
+    row("Estimate",  f["Microsoft.VSTS.Scheduling.OriginalEstimate"] != null ? `${f["Microsoft.VSTS.Scheduling.OriginalEstimate"]}h` : null),
+    row("Completed", f["Microsoft.VSTS.Scheduling.CompletedWork"] != null ? `${f["Microsoft.VSTS.Scheduling.CompletedWork"]}h` : null),
+    `Created: ${dn("System.CreatedBy")} · ${String(f["System.CreatedDate"] ?? "").slice(0, 10)}`,
+    `Updated: ${dn("System.ChangedBy")} · ${String(f["System.ChangedDate"] ?? "").slice(0, 10)}`,
+  ].filter(Boolean).join("\n");
 
-  // ── Rich text fields ───────────────────────────────────────────────────────
+  // ── Rich text fields (truncated to keep context lean) ─────────────────────
   const description = f["System.Description"]
-    ? stripHtml(String(f["System.Description"]))
+    ? trunc(stripHtml(String(f["System.Description"])))
     : "";
   const acceptance = f["Microsoft.VSTS.Common.AcceptanceCriteria"]
-    ? stripHtml(String(f["Microsoft.VSTS.Common.AcceptanceCriteria"]))
+    ? trunc(stripHtml(String(f["Microsoft.VSTS.Common.AcceptanceCriteria"])))
     : "";
   const reproSteps = f["Microsoft.VSTS.TCM.ReproSteps"]
-    ? stripHtml(String(f["Microsoft.VSTS.TCM.ReproSteps"]))
+    ? trunc(stripHtml(String(f["Microsoft.VSTS.TCM.ReproSteps"])))
     : "";
   const systemInfo = f["Microsoft.VSTS.TCM.SystemInfo"]
-    ? stripHtml(String(f["Microsoft.VSTS.TCM.SystemInfo"]))
+    ? trunc(stripHtml(String(f["Microsoft.VSTS.TCM.SystemInfo"])))
     : "";
 
   // ── Relations ─────────────────────────────────────────────────────────────
@@ -174,15 +180,14 @@ function fmtWIFull(wi: WorkItem, comments: Array<{ createdBy: { displayName: str
 
   const devLinks = [prSection, commitSection, buildSection].filter(Boolean).join("\n\n");
 
-  // ── Comments ───────────────────────────────────────────────────────────────
+  // ── Comments (last 5 only to keep context lean) ───────────────────────────
+  const recentComments = comments.slice(-5);
   const commentBlock =
     comments.length === 0
       ? "No comments."
-      : comments
-          .map(
-            (c) =>
-              `[${c.createdDate.slice(0, 16)}] ${c.createdBy.displayName}\n${stripHtml(c.text)}`,
-          )
+      : (comments.length > 5 ? `(${comments.length - 5} earlier comments omitted)\n\n` : "") +
+        recentComments
+          .map((c) => `[${c.createdDate.slice(0, 10)}] ${c.createdBy.displayName}\n${trunc(stripHtml(c.text))}`)
           .join("\n\n");
 
   return [
@@ -227,333 +232,259 @@ const LINK_TYPES = [
 ];
 
 export const TOOLS: Tool[] = [
-  // ── Auth & Project ───────────────────────────────────────────────────────────
   {
     name: "auth_status",
-    description:
-      "Check auth health and available projects. Use when credentials may be expired (401 errors), to see which org/project is active, or to diagnose permission issues before calling other tools.",
+    description: "Check credentials and list available projects. Call on 401 errors.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "switch_project",
-    description:
-      "List all Azure DevOps projects in the org and switch the active one. Use at the start of a session when no project is set, or when the user wants to work on a different project. Call with no arguments to list options.",
+    description: "List all projects or switch the active one. Call first if no project is set.",
     inputSchema: {
       type: "object",
-      properties: {
-        project: { type: "string", description: "Project name to switch to (omit to list all)" },
-      },
+      properties: { project: { type: "string", description: "Project name (omit to list all)" } },
     },
   },
-
-  // ── Work Items ───────────────────────────────────────────────────────────────
   {
     name: "list_work_items",
-    description:
-      "Search and filter work items. Use for: 'show my tasks', 'what's in this sprint', 'find all active bugs', 'search for X'. Combine filters freely — mine+sprint+state. No filters returns the 20 most recently updated items.",
+    description: "List/search work items. Filters: mine, sprint, state, type, keyword.",
     inputSchema: {
       type: "object",
       properties: {
-        mine: { type: "boolean", description: "Only items assigned to me (non-Closed)" },
-        sprint: { type: "boolean", description: "Only items in the current sprint" },
-        state: {
-          type: "string",
-          enum: WI_STATES,
-          description: "Filter by state",
-        },
-        type: {
-          type: "string",
-          enum: WI_TYPES,
-          description: "Filter by work item type",
-        },
-        keyword: { type: "string", description: "Full-text search across title and description" },
-        top: { type: "number", description: "Max results (default 20)" },
+        mine: { type: "boolean", description: "Only my open items" },
+        sprint: { type: "boolean", description: "Only current sprint items" },
+        state: { type: "string", enum: WI_STATES },
+        type: { type: "string", enum: WI_TYPES },
+        keyword: { type: "string", description: "Search title and description" },
+        top: { type: "number", description: "Max results (default 15)" },
       },
     },
   },
   {
     name: "get_work_item",
-    description:
-      "Get full detail for one work item by ID — all fields, description, acceptance criteria, repro steps, comments, linked PRs, commits, builds, and inline images. Use when the user asks to see or review a specific ticket.",
+    description: "Get full detail for one work item — fields, comments, linked PRs/builds.",
     inputSchema: {
       type: "object",
-      properties: { id: { type: "number", description: "Work item ID" } },
+      properties: {
+        id: { type: "number", description: "Work item ID" },
+        images: { type: "boolean", description: "Include inline images (slow, large — default false)" },
+      },
       required: ["id"],
     },
   },
   {
     name: "create_work_item",
-    description:
-      "Create a new work item. Use when a user asks to create a task, bug, story, etc. type and title are required. For bugs include reproSteps. For user stories include acceptanceCriteria. Check list_work_items first to confirm sprint/area path values exist.",
+    description: "Create a work item (task, bug, story, epic, etc).",
     inputSchema: {
       type: "object",
       properties: {
-        type: { type: "string", enum: WI_TYPES, description: "Work item type" },
+        type: { type: "string", enum: WI_TYPES },
         title: { type: "string" },
-        description: { type: "string", description: "HTML or plain text description" },
+        description: { type: "string" },
         assignedTo: { type: "string", description: "Email or display name" },
-        priority: {
-          type: "number",
-          enum: [1, 2, 3, 4],
-          description: "1=Critical 2=High 3=Medium 4=Low",
-        },
-        state: { type: "string", enum: WI_STATES, description: "Initial state (default: New)" },
-        iterationPath: { type: "string", description: "Sprint path e.g. MyProject\\Sprint 3" },
-        areaPath: { type: "string", description: "Area path e.g. MyProject\\Backend" },
-        parentId: { type: "number", description: "Parent work item ID" },
+        priority: { type: "number", enum: [1, 2, 3, 4], description: "1=Critical 4=Low" },
+        state: { type: "string", enum: WI_STATES },
+        iterationPath: { type: "string", description: "Sprint path" },
+        areaPath: { type: "string" },
+        parentId: { type: "number" },
         storyPoints: { type: "number" },
-        tags: { type: "string", description: "Semicolon-separated tags" },
-        acceptanceCriteria: { type: "string", description: "User Story acceptance criteria" },
-        reproSteps: { type: "string", description: "Bug repro steps" },
+        tags: { type: "string", description: "Semicolon-separated" },
+        acceptanceCriteria: { type: "string" },
+        reproSteps: { type: "string", description: "Bug only" },
       },
       required: ["type", "title"],
     },
   },
   {
     name: "update_work_item",
-    description:
-      "Update fields on an existing work item. Use to close a task, reassign, change state, move to a sprint, or update estimates. Only supply the fields you want to change — omitted fields are untouched. Use comment to append to the discussion thread.",
+    description: "Update fields on a work item. Only supply fields to change.",
     inputSchema: {
       type: "object",
       properties: {
         id: { type: "number" },
         title: { type: "string" },
         state: { type: "string", enum: WI_STATES },
-        assignedTo: { type: "string", description: "Email, display name, or empty string to unassign" },
+        assignedTo: { type: "string", description: "Empty string to unassign" },
         priority: { type: "number", enum: [1, 2, 3, 4] },
         iterationPath: { type: "string" },
         areaPath: { type: "string" },
         storyPoints: { type: "number" },
         tags: { type: "string" },
-        comment: { type: "string", description: "Append a discussion comment (markdown)" },
+        comment: { type: "string", description: "Append a discussion comment" },
       },
       required: ["id"],
     },
   },
   {
     name: "add_comment",
-    description:
-      "Post a discussion comment on a work item. Use when the user wants to leave a note, status update, or question on a ticket without changing any fields.",
+    description: "Post a discussion comment on a work item.",
     inputSchema: {
       type: "object",
       properties: {
         workItemId: { type: "number" },
-        text: { type: "string", description: "Comment body (markdown supported)" },
+        text: { type: "string" },
       },
       required: ["workItemId", "text"],
     },
   },
   {
     name: "link_work_items",
-    description:
-      "Create a relationship link between two work items. Use to set parent/child hierarchy, mark items as related, or specify predecessor/successor dependencies. sourceId → targetId in the direction of linkType.",
+    description: "Link two work items (parent/child, related, dependency).",
     inputSchema: {
       type: "object",
       properties: {
-        sourceId: { type: "number", description: "Work item to link from" },
-        targetId: { type: "number", description: "Work item to link to" },
-        linkType: {
-          type: "string",
-          enum: LINK_TYPES,
-          description:
-            "Hierarchy-Forward=parent→child, Hierarchy-Reverse=child→parent, Related=related, Dependency-Forward=successor, Dependency-Reverse=predecessor",
-        },
-        comment: { type: "string", description: "Optional comment for the link" },
+        sourceId: { type: "number" },
+        targetId: { type: "number" },
+        linkType: { type: "string", enum: LINK_TYPES },
+        comment: { type: "string" },
       },
       required: ["sourceId", "targetId", "linkType"],
     },
   },
   {
     name: "query_wiql",
-    description:
-      "Run a raw WIQL query for advanced filtering not possible with list_work_items. Use for custom cross-field queries, date ranges, or complex logic. Example: SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project AND [System.ChangedDate] >= @Today - 7",
+    description: "Run a raw WIQL query for advanced filtering.",
     inputSchema: {
       type: "object",
       properties: {
-        wiql: { type: "string", description: "WIQL query string" },
+        wiql: { type: "string" },
         top: { type: "number", description: "Max results (default 50)" },
       },
       required: ["wiql"],
     },
   },
-
-  // ── Repositories ────────────────────────────────────────────────────────────
   {
     name: "list_repos",
-    description:
-      "List all Git repositories in the project with their default branch and remote URLs. Use to discover repo names before calling list_commits, list_pull_requests, get_file, or create_pr.",
+    description: "List all Git repositories in the project.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "list_commits",
-    description:
-      "List recent commits in a repository. Use when reviewing recent changes, finding who changed what, or auditing activity on a branch.",
+    description: "List recent commits in a repository.",
     inputSchema: {
       type: "object",
       properties: {
-        repo: { type: "string", description: "Repository name or ID (use list_repos to find)" },
-        branch: { type: "string", description: "Branch name (default: repo default branch)" },
-        top: { type: "number", description: "Number of commits (default 20)" },
+        repo: { type: "string" },
+        branch: { type: "string" },
+        top: { type: "number", description: "Default 20" },
       },
       required: ["repo"],
     },
   },
   {
     name: "get_file",
-    description:
-      "Read the contents of a file from a repository. Use when reviewing code, reading config, checking a README, or understanding an implementation. Returns up to 500 lines.",
+    description: "Read a file from a repository (up to 500 lines).",
     inputSchema: {
       type: "object",
       properties: {
-        repo: { type: "string", description: "Repository name or ID" },
-        path: { type: "string", description: "File path e.g. /src/index.ts or /README.md" },
-        branch: { type: "string", description: "Branch name (default: repo default branch)" },
+        repo: { type: "string" },
+        path: { type: "string", description: "e.g. /src/index.ts" },
+        branch: { type: "string" },
       },
       required: ["repo", "path"],
     },
   },
   {
     name: "list_files",
-    description:
-      "List files and folders in a repository directory. Use to explore a repo's structure before reading specific files with get_file.",
+    description: "List files/folders in a repository directory.",
     inputSchema: {
       type: "object",
       properties: {
-        repo: { type: "string", description: "Repository name or ID" },
-        path: { type: "string", description: "Directory path (default: root /)" },
-        branch: { type: "string", description: "Branch name (default: repo default branch)" },
+        repo: { type: "string" },
+        path: { type: "string", description: "Directory path (default: /)" },
+        branch: { type: "string" },
       },
       required: ["repo"],
     },
   },
   {
     name: "list_pull_requests",
-    description:
-      "List pull requests in a repository. Use to review open PRs, check merge status, see reviewer votes, or find PRs by status. Default status is active.",
+    description: "List pull requests with status, branch, and reviewer votes.",
     inputSchema: {
       type: "object",
       properties: {
-        repo: { type: "string", description: "Repository name or ID" },
-        status: {
-          type: "string",
-          enum: PR_STATUSES,
-          description: "PR status filter (default: active)",
-        },
+        repo: { type: "string" },
+        status: { type: "string", enum: PR_STATUSES, description: "Default: active" },
       },
       required: ["repo"],
     },
   },
   {
     name: "create_pr",
-    description:
-      "Create a pull request in a repository. Use when a user asks to open a PR, submit code for review, or merge a branch. Use list_repos to get the repo ID first. sourceBranch is the feature branch; targetBranch is usually main or master.",
+    description: "Create a pull request.",
     inputSchema: {
       type: "object",
       properties: {
-        repo: { type: "string", description: "Repository name or ID" },
-        title: { type: "string", description: "PR title" },
-        sourceBranch: { type: "string", description: "Feature branch to merge from (e.g. feature/my-work)" },
-        targetBranch: { type: "string", description: "Branch to merge into (default: main)" },
-        description: { type: "string", description: "PR description (markdown)" },
-        isDraft: { type: "boolean", description: "Create as draft (default: false)" },
-        reviewers: {
-          type: "array",
-          items: { type: "string" },
-          description: "Reviewer email addresses",
-        },
-        workItemIds: {
-          type: "array",
-          items: { type: "number" },
-          description: "Work item IDs to link to this PR",
-        },
+        repo: { type: "string" },
+        title: { type: "string" },
+        sourceBranch: { type: "string" },
+        targetBranch: { type: "string", description: "Default: main" },
+        description: { type: "string" },
+        isDraft: { type: "boolean" },
+        reviewers: { type: "array", items: { type: "string" }, description: "Email addresses" },
+        workItemIds: { type: "array", items: { type: "number" } },
       },
       required: ["repo", "title", "sourceBranch"],
     },
   },
-
-  // ── Pipelines & Builds ───────────────────────────────────────────────────────
   {
     name: "list_pipelines",
-    description:
-      "List all CI/CD pipeline definitions in the project. Use to discover pipeline IDs before running run_pipeline or filtering list_builds.",
+    description: "List all CI/CD pipeline definitions.",
     inputSchema: { type: "object", properties: {} },
   },
   {
     name: "list_builds",
-    description:
-      "List recent CI/CD build runs with status, result, branch, duration, and a direct link. Use to check if builds are passing, diagnose failures, or see what's currently running.",
+    description: "List recent build runs with status, result, and link.",
     inputSchema: {
       type: "object",
       properties: {
-        pipelineId: { type: "number", description: "Pipeline / definition ID (use list_pipelines)" },
-        branch: { type: "string", description: "Branch filter e.g. refs/heads/main" },
-        status: {
-          type: "string",
-          enum: BUILD_STATUSES,
-          description: "Build status filter",
-        },
-        result: {
-          type: "string",
-          enum: BUILD_RESULTS,
-          description: "Build result filter",
-        },
-        top: { type: "number", description: "Number of results (default 10)" },
+        pipelineId: { type: "number" },
+        branch: { type: "string" },
+        status: { type: "string", enum: BUILD_STATUSES },
+        result: { type: "string", enum: BUILD_RESULTS },
+        top: { type: "number", description: "Default 10" },
       },
     },
   },
   {
     name: "run_pipeline",
-    description:
-      "Trigger a pipeline run. Use when a user asks to deploy, build, or run a CI/CD pipeline. Get the pipelineId from list_pipelines first.",
+    description: "Trigger a pipeline run.",
     inputSchema: {
       type: "object",
       properties: {
-        pipelineId: { type: "number", description: "Pipeline definition ID" },
-        branch: { type: "string", description: "Branch to build (default: pipeline default)" },
-        variables: {
-          type: "object",
-          description: "Key-value variables to pass to the pipeline",
-          additionalProperties: { type: "string" },
-        },
+        pipelineId: { type: "number" },
+        branch: { type: "string" },
+        variables: { type: "object", additionalProperties: { type: "string" } },
       },
       required: ["pipelineId"],
     },
   },
   {
     name: "get_build_logs",
-    description:
-      "Get the output logs of a build run. Returns the last 150 lines. Use to diagnose why a build failed. Get the buildId from list_builds first.",
+    description: "Get build output logs (last 80 lines) to diagnose failures.",
     inputSchema: {
       type: "object",
       properties: {
-        buildId: { type: "number", description: "Build run ID (from list_builds)" },
-        logId: { type: "number", description: "Specific log ID (omit for the latest task log)" },
+        buildId: { type: "number" },
+        logId: { type: "number", description: "Specific log (omit for latest)" },
       },
       required: ["buildId"],
     },
   },
-
-  // ── Sprints ──────────────────────────────────────────────────────────────────
   {
     name: "get_sprint",
-    description:
-      "Get the current sprint — name, start/end dates, and per-member capacity. Use when asked about the current sprint, planning remaining capacity, or checking sprint dates.",
+    description: "Get current sprint — name, dates, and team capacity.",
     inputSchema: {
       type: "object",
-      properties: {
-        team: { type: "string", description: "Team name (default: first team in project)" },
-      },
+      properties: { team: { type: "string", description: "Default: first team" } },
     },
   },
   {
     name: "list_sprints",
-    description:
-      "List all sprints / iterations for a team with start and end dates. Use to plan future work, find a sprint path for create_work_item, or see the sprint history.",
+    description: "List all sprints with start/end dates.",
     inputSchema: {
       type: "object",
-      properties: {
-        team: { type: "string", description: "Team name (default: first team in project)" },
-      },
+      properties: { team: { type: "string", description: "Default: first team" } },
     },
   },
 ];
@@ -638,7 +569,7 @@ export async function handleTool(
                 keyword,
                 state: opt(args, "state"),
                 type: opt(args, "type"),
-                top: opt<number>(args, "top") ?? 20,
+                top: opt<number>(args, "top") ?? 15,
               }),
             ),
           );
@@ -650,7 +581,7 @@ export async function handleTool(
               currentSprint: opt<boolean>(args, "sprint"),
               state: opt(args, "state"),
               type: opt(args, "type"),
-              top: opt<number>(args, "top") ?? 20,
+              top: opt<number>(args, "top") ?? 15,
             }),
           ),
         );
@@ -658,44 +589,36 @@ export async function handleTool(
 
       case "get_work_item": {
         const id = num(args, "id");
+        const includeImages = opt<boolean>(args, "images") ?? false;
         const [wi, comments] = await Promise.all([
           client.getWorkItem(id),
           client.listComments(id).catch(() => []),
         ]);
 
-        // Collect img URLs from all HTML fields
-        const htmlFields = [
-          wi.fields["System.Description"],
-          wi.fields["Microsoft.VSTS.Common.AcceptanceCriteria"],
-          wi.fields["Microsoft.VSTS.TCM.ReproSteps"],
-          wi.fields["Microsoft.VSTS.TCM.SystemInfo"],
-        ]
-          .filter(Boolean)
-          .map(String);
-
-        const seenUrls = new Set<string>();
-        const imgUrls: string[] = [];
-        for (const html of htmlFields) {
-          for (const u of extractImageUrls(html, 8)) {
-            if (!seenUrls.has(u)) { seenUrls.add(u); imgUrls.push(u); }
-            if (imgUrls.length >= 8) break;
-          }
-          if (imgUrls.length >= 8) break;
-        }
-
-        // Download images in parallel (best-effort — failures are silently dropped)
-        const images = imgUrls.length
-          ? (await Promise.all(imgUrls.map((u) => client.downloadAttachment(u)))).filter(Boolean)
-          : [];
-
         const content: CallToolResult["content"] = [
           { type: "text", text: fmtWIFull(wi, comments) },
-          ...images.map((img) => ({
-            type: "image" as const,
-            data: img!.data,
-            mimeType: img!.mimeType,
-          })),
         ];
+
+        // Images are opt-in — they're large and slow to download
+        if (includeImages) {
+          const htmlFields = [
+            wi.fields["System.Description"],
+            wi.fields["Microsoft.VSTS.Common.AcceptanceCriteria"],
+            wi.fields["Microsoft.VSTS.TCM.ReproSteps"],
+          ].filter(Boolean).map(String);
+
+          const imgUrls: string[] = [];
+          const seen = new Set<string>();
+          for (const html of htmlFields) {
+            for (const u of extractImageUrls(html, 4)) {
+              if (!seen.has(u)) { seen.add(u); imgUrls.push(u); }
+              if (imgUrls.length >= 4) break;
+            }
+          }
+          const images = (await Promise.all(imgUrls.map((u) => client.downloadAttachment(u)))).filter(Boolean);
+          content.push(...images.map((img) => ({ type: "image" as const, data: img!.data, mimeType: img!.mimeType })));
+        }
+
         return { content };
       }
 
@@ -945,8 +868,8 @@ export async function handleTool(
         if (logId != null) {
           const text = await client.getBuildLogContent(buildId, logId);
           const lines = text.split("\n");
-          const tail = lines.slice(-150).join("\n");
-          return ok(lines.length > 150 ? `... (${lines.length - 150} lines above)\n\n${tail}` : tail);
+          const tail = lines.slice(-80).join("\n");
+          return ok(lines.length > 80 ? `... (${lines.length - 80} lines above)\n\n${tail}` : tail);
         }
         // No logId — list logs and return the last task log content
         const logs = await client.getBuildLogs(buildId);
@@ -954,9 +877,9 @@ export async function handleTool(
         const last = logs[logs.length - 1]!;
         const text = await client.getBuildLogContent(buildId, last.id);
         const lines = text.split("\n");
-        const tail = lines.slice(-150).join("\n");
-        const header = `Build #${buildId} — log ${last.id}/${logs.length} (last 150 lines)\n\n`;
-        return ok(header + (lines.length > 150 ? `... (${lines.length - 150} lines above)\n\n${tail}` : tail));
+        const tail = lines.slice(-80).join("\n");
+        const header = `Build #${buildId} — log ${last.id}/${logs.length} (last 80 lines)\n\n`;
+        return ok(header + (lines.length > 80 ? `... (${lines.length - 80} lines above)\n\n${tail}` : tail));
       }
 
       // ── Sprints ──────────────────────────────────────────────────────────────

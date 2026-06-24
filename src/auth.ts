@@ -21,15 +21,11 @@ const BUNDLED_CLIENT_ID = "e2ba32e7-6d24-4919-ba7b-37199c495247";
 const BUNDLED_TENANT_ID = "organizations"; // accepts any Azure AD tenant
 
 const ADO_RESOURCE = "499b84ac-1321-427f-aa17-267ca6975798";
-const ADO_SCOPES_FULL = [
-  `${ADO_RESOURCE}/vso.work_write`,
-  `${ADO_RESOURCE}/vso.build_execute`,
-  `${ADO_RESOURCE}/vso.code`,
-];
-const ADO_SCOPES_READONLY = [
-  `${ADO_RESOURCE}/vso.work`,
-  `${ADO_RESOURCE}/vso.code`,
-];
+// .default requests all delegated permissions the app has been granted on this resource.
+// More reliable than listing specific vso.* scopes — Azure accepts it as long as the app
+// has any Azure DevOps permission (user_impersonation) in its registration.
+const ADO_SCOPES_FULL = [`${ADO_RESOURCE}/.default`];
+const ADO_SCOPES_READONLY = [`${ADO_RESOURCE}/.default`];
 
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -195,7 +191,7 @@ async function flowOAuth(readOnly: boolean, clientIdArg?: string, tenantIdArg?: 
     console.log(`Using custom app: client=${clientId} tenant=${tenantId}`);
   }
   const scopes = readOnly ? ADO_SCOPES_READONLY : ADO_SCOPES_FULL;
-  const allScopes = [...scopes, "openid", "profile", "offline_access"].join(" ");
+  const allScopes = [...scopes, "offline_access"].join(" ");
 
   const port = await findFreePort();
   const redirectUri = `http://localhost:${port}`;
@@ -203,18 +199,20 @@ async function flowOAuth(readOnly: boolean, clientIdArg?: string, tenantIdArg?: 
   const { verifier, challenge } = generatePkce();
   const state = randomBytes(16).toString("hex");
 
-  // Build authorization URL manually
+  // Build authorization URL — encode scope with %20 (not +) to avoid any
+  // Azure parser edge cases with plus-encoded spaces in the scope value.
   const authParams = new URLSearchParams({
     client_id: clientId,
     response_type: "code",
     redirect_uri: redirectUri,
     response_mode: "query",
-    scope: allScopes,
     code_challenge: challenge,
     code_challenge_method: "S256",
     state,
   });
-  const authUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize?${authParams}`;
+  const authUrl =
+    `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/authorize` +
+    `?${authParams}&scope=${encodeURIComponent(allScopes)}`;
 
   console.log("\nOpening browser for Azure sign-in…");
   console.log("If it doesn't open, visit:\n");
@@ -365,42 +363,99 @@ function findFreePort(): Promise<number> {
   });
 }
 
-/** Spin up a one-shot HTTP server, wait for the OAuth callback, return the auth code. */
+/** Spin up a one-shot HTTP server, wait for the OAuth callback, return the auth code.
+ *  Falls back to manual URL paste after 20 s — handles corporate proxies that block
+ *  browser→localhost redirects. */
 function waitForAuthCode(port: number, expectedState: string): Promise<string> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const done = (code: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hintTimer);
+      clearTimeout(hardTimeout);
+      srv.close(() => {});
+      resolve(code);
+    };
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(hintTimer);
+      clearTimeout(hardTimeout);
+      srv.close(() => {});
+      reject(err);
+    };
+
+    const htmlPage = (msg: string, ok: boolean) =>
+      `<html><head><title>Azure DevOps MCP</title></head><body style="font-family:sans-serif;padding:40px">` +
+      `<h2 style="color:${ok ? "#107c10" : "#a80000"}">${msg}</h2>` +
+      `<p>You can close this tab and return to the terminal.</p></body></html>`;
+
     const srv = createServer((req, res) => {
       const url = new URL(req.url ?? "/", `http://localhost:${port}`);
       const code = url.searchParams.get("code");
-      const error = url.searchParams.get("error");
       const state = url.searchParams.get("state");
-
-      const html = (msg: string, ok: boolean) =>
-        `<html><head><title>Azure DevOps MCP</title></head><body style="font-family:sans-serif;padding:40px">` +
-        `<h2 style="color:${ok ? "#107c10" : "#a80000"}">${msg}</h2>` +
-        `<p>You can close this tab and return to the terminal.</p></body></html>`;
+      const error = url.searchParams.get("error");
 
       if (code && state === expectedState) {
         res.writeHead(200, { "Content-Type": "text/html" });
-        res.end(html("Authentication successful!", true));
-        srv.close();
-        resolve(code);
+        res.end(htmlPage("Authentication successful! You can close this tab.", true));
+        done(code);
       } else if (error) {
         res.writeHead(400, { "Content-Type": "text/html" });
-        res.end(html(`Authentication failed: ${error}`, false));
-        srv.close();
-        reject(new Error(error));
+        res.end(htmlPage(`Authentication failed: ${error}`, false));
+        fail(new Error(`Auth error from Azure: ${error}`));
       } else {
         res.writeHead(400, { "Content-Type": "text/html" });
-        res.end(html("Unexpected request.", false));
+        res.end(htmlPage("Unexpected request.", false));
       }
     });
     srv.listen(port, "127.0.0.1");
-    srv.on("error", reject);
+    srv.on("error", fail);
 
-    // Safety timeout — 5 minutes
-    setTimeout(() => {
-      srv.close();
-      reject(new Error("OAuth timeout: no response from browser within 5 minutes"));
+    // After 20 s with no redirect (e.g. corporate proxy blocks localhost),
+    // prompt the user to paste the redirect URL from the browser's address bar.
+    const hintTimer = setTimeout(async () => {
+      if (settled) return;
+      process.stderr.write(
+        "\n──────────────────────────────────────────────────────────\n" +
+        "Browser didn't redirect automatically?\n" +
+        "  1. Look at your browser's address bar — it may show a URL\n" +
+        "     starting with  http://localhost:" + port + "/?code=...\n" +
+        "  2. Copy that full URL and paste it below.\n" +
+        "  3. Still signing in? Just wait — this prompt stays open.\n" +
+        "──────────────────────────────────────────────────────────\n\n",
+      );
+
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        const pasted = (await rl.question("Paste redirect URL (or wait for auto-redirect): ")).trim();
+        rl.close();
+        if (settled || !pasted) return; // user pressed Enter with nothing — keep waiting
+
+        let parsed: URL;
+        try { parsed = new URL(pasted); }
+        catch { return fail(new Error("Invalid URL pasted — could not parse.")); }
+
+        const code = parsed.searchParams.get("code");
+        const state = parsed.searchParams.get("state");
+        const error = parsed.searchParams.get("error");
+
+        if (error) return fail(new Error(`Auth error in redirect: ${error}`));
+        if (!code) return fail(new Error("No 'code' found in the pasted URL. Make sure you copied the full browser address."));
+        if (state !== expectedState) return fail(new Error("State mismatch in pasted URL — try authenticating again."));
+        done(code);
+      } catch (e) {
+        rl.close();
+        if (!settled) fail(e instanceof Error ? e : new Error(String(e)));
+      }
+    }, 20_000);
+
+    // Hard 5-minute total timeout
+    const hardTimeout = setTimeout(() => {
+      fail(new Error("OAuth timeout: no response after 5 minutes. Try again."));
     }, 5 * 60_000);
   });
 }

@@ -14,7 +14,7 @@ import { AzureDevOpsClient } from "./client.ts";
 import { TOOLS, handleTool } from "./tools.ts";
 import { cmdInstall, cmdInstallSkill } from "./install.ts";
 
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 const args = process.argv.slice(2);
 const [cmd] = args;
 
@@ -124,6 +124,19 @@ if (!auth) {
 }
 
 const client = new AzureDevOpsClient(auth);
+
+// Pre-warm cache in background — don't block server startup
+Promise.resolve().then(async () => {
+  try {
+    const teams = await client.listTeams();
+    if (teams[0]) {
+      await Promise.all([
+        client.getCurrentIteration(teams[0].name),
+        client.listWorkItems({ assignedToMe: true, top: 5 }),
+      ]);
+    }
+  } catch { /* ignore — cache pre-warm is best-effort */ }
+});
 
 const server = new Server(
   { name: "azure-board-mcp", version: VERSION },

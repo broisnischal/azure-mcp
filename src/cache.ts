@@ -9,12 +9,15 @@ interface Entry<T> {
 }
 
 export const TTL = {
-  USER: 60 * 60_000,     // 1 h  — identity rarely changes
+  USER: 60 * 60_000,     // 1 h
   PROJECT: 60 * 60_000,  // 1 h
   TEAMS: 30 * 60_000,    // 30 m
-  SPRINT: 5 * 60_000,    // 5 m  — must stay fresh during active sprints
-  PATHS: 60 * 60_000,    // 1 h  — area / iteration trees
-  WI_LIST: 30_000,       // 30 s — recent list to avoid double-fetches in one turn
+  SPRINT: 5 * 60_000,    // 5 m
+  PATHS: 60 * 60_000,    // 1 h
+  REPOS: 5 * 60_000,     // 5 m  — repo list rarely changes
+  ITERS: 15 * 60_000,    // 15 m — sprint list rarely changes
+  WI: 2 * 60_000,        // 2 m  — individual work item
+  WI_LIST: 60_000,       // 1 m  — query results
 } as const;
 
 export class Cache {
