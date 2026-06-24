@@ -1,14 +1,12 @@
-#!/usr/bin/env bun
-// ─── Azure Boards MCP Server ──────────────────────────────────────────────────
+#!/usr/bin/env node
+// ─── Azure DevOps MCP ─────────────────────────────────────────────────────────
 //
-//  Usage (stdio transport — for Claude Desktop / Claude Code):
-//    $ bun run src/index.ts
-//    $ azure-boards-mcp           ← after `bun link`
-//
-//  Env vars (or .env file):
-//    AZURE_ORG      — your Azure DevOps org name
-//    AZURE_PROJECT  — project name
-//    AZURE_PAT      — Personal Access Token (Work Items: Read & Write)
+//  CLI usage:
+//    npx azure-board-mcp authenticate          ← PAT setup wizard
+//    npx azure-board-mcp authenticate --oauth  ← OAuth device code (needs AZURE_CLIENT_ID)
+//    npx azure-board-mcp check                 ← validate stored credentials
+//    npx azure-board-mcp logout                ← clear stored credentials
+//    npx azure-board-mcp                       ← start MCP server (stdio)
 //
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -17,103 +15,64 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { loadAuth, cmdAuthenticate, cmdCheck, cmdLogout } from "./auth.ts";
 import { AzureDevOpsClient } from "./client.ts";
-import { TOOLS, handleTool } from "./tools.js";
+import { TOOLS, handleTool } from "./tools.ts";
 
-// ── Config ────────────────────────────────────────────────────────────────────
+const [cmd] = process.argv.slice(2);
 
-async function loadEnvFromConfigFile(): Promise<void> {
-  const home = process.env["HOME"];
-  if (!home) return;
+// ── CLI commands ──────────────────────────────────────────────────────────────
 
-  const path = `${home}/.config/azure-boards-mcp/.env`;
-  const file = Bun.file(path);
-  if (!(await file.exists())) return;
-
-  const raw = await file.text();
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#")) continue;
-
-    const idx = trimmed.indexOf("=");
-    if (idx <= 0) continue;
-
-    const key = trimmed.slice(0, idx).trim();
-    if (!key || process.env[key]) continue;
-
-    process.env[key] = trimmed.slice(idx + 1).trim();
-  }
+if (cmd === "authenticate" || cmd === "auth") {
+  const readOnly = process.argv.includes("--read-only");
+  const oauth = process.argv.includes("--oauth");
+  await cmdAuthenticate({ readOnly, oauth });
+  process.exit(0);
 }
 
-async function loadConfig() {
-  await loadEnvFromConfigFile();
-
-  // Support .env file automatically via Bun
-  const org = process.env["AZURE_ORG"];
-  const project = process.env["AZURE_PROJECT"];
-  const pat = process.env["AZURE_PAT"];
-
-  const missing = (["AZURE_ORG", "AZURE_PROJECT", "AZURE_PAT"] as const).filter(
-    (k) => !process.env[k],
-  );
-
-  if (missing.length > 0) {
-    console.error(
-      `\n❌ Missing required environment variables: ${missing.join(", ")}`,
-    );
-    console.error(`
-Set them via .env or shell:
-
-  export AZURE_ORG=my-org
-  export AZURE_PROJECT=my-project
-  export AZURE_PAT=<your PAT token>
-
-Or add to ~/.config/azure-boards-mcp/.env
-`);
-    process.exit(1);
-  }
-
-  return { org: org!, project: project!, pat: pat! };
+if (cmd === "check") {
+  await cmdCheck();
+  process.exit(0);
 }
 
-// ── Server ────────────────────────────────────────────────────────────────────
+if (cmd === "logout") {
+  await cmdLogout();
+  process.exit(0);
+}
 
-async function main() {
-  const cfg = await loadConfig();
-  const client = new AzureDevOpsClient(cfg);
+// ── MCP server ────────────────────────────────────────────────────────────────
 
-  const server = new Server(
-    {
-      name: "azure-boards-mcp",
-      version: "1.0.0",
-    },
-    {
-      capabilities: { tools: {} },
-    },
-  );
-
-  // List available tools
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: TOOLS,
-  }));
-
-  // Handle tool calls
-  server.setRequestHandler(CallToolRequestSchema, async (req) => {
-    const { name, arguments: args = {} } = req.params;
-    return handleTool(client, name, args as Record<string, unknown>);
-  });
-
-  // Connect via stdio (standard MCP transport)
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-
-  // stderr only — stdout is reserved for MCP protocol messages
+const auth = await loadAuth();
+if (!auth) {
   console.error(
-    `✅ Azure Boards MCP running (org: ${cfg.org} / project: ${cfg.project})`,
+    [
+      "Not authenticated.",
+      "",
+      "Run one of:",
+      "  npx azure-board-mcp authenticate          (PAT — no app registration needed)",
+      "  npx azure-board-mcp authenticate --oauth  (OAuth device code, needs AZURE_CLIENT_ID)",
+      "",
+      "Or set env vars:  AZURE_ORG  AZURE_PROJECT  AZURE_PAT",
+    ].join("\n"),
   );
+  process.exit(1);
 }
 
-main().catch((e) => {
-  console.error("Fatal:", e);
-  process.exit(1);
+const client = new AzureDevOpsClient(auth);
+
+const server = new Server(
+  { name: "azure-mcp", version: "1.1.0" },
+  { capabilities: { tools: {} } },
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const { name, arguments: args = {} } = req.params;
+  return handleTool(client, name, args as Record<string, unknown>);
 });
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+
+console.error(`Azure MCP ready  (${auth.org} / ${auth.project})`);

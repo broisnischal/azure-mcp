@@ -1,7 +1,7 @@
 {
   "name": "azure-board-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for Azure DevOps Boards (work items). Stdio transport; requires Bun.",
+  "version": "1.1.0",
+  "description": "MCP server for Azure DevOps — work items, builds, and PRs. Installable via npx/bunx with OAuth or PAT auth.",
   "mcpName": "io.github.broisnischal/azure-mcp",
   "license": "MIT",
   "repository": {
@@ -12,32 +12,36 @@
     "mcp",
     "model-context-protocol",
     "azure-devops",
-    "azure-boards"
+    "azure-boards",
+    "azure-pipelines"
   ],
   "engines": {
-    "bun": ">=1.0.0"
+    "node": ">=18.0.0"
   },
-  "module": "index.ts",
   "type": "module",
+  "main": "./dist/index.js",
+  "bin": {
+    "azure-mcp": "./dist/index.js",
+    "azure-board-mcp": "./dist/index.js"
+  },
   "files": [
-    "src",
+    "dist",
     "README.md"
   ],
   "dependencies": {
+    "@azure/msal-node": "^2.16.2",
     "@modelcontextprotocol/sdk": "latest"
   },
   "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
+    "@types/bun": "latest",
     "typescript": "^5"
-  },
-  "bin": {
-    "azure-boards-mcp": "./src/index.ts"
   },
   "scripts": {
     "dev": "bun run src/index.ts",
     "start": "bun run src/index.ts",
-    "lint": "bunx tsc --noEmit"
+    "build": "bun build src/index.ts --outfile dist/index.js --target node",
+    "lint": "bunx tsc --noEmit",
+    "prepublishOnly": "bun run build",
+    "publish:npm": "npm publish --access public"
   }
 }

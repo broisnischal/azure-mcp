@@ -2,15 +2,10 @@
 // Docs: https://learn.microsoft.com/en-us/rest/api/azure/devops
 // API version pinned to 7.1 across all endpoints
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Config & shared types
-// ═════════════════════════════════════════════════════════════════════════════
+import { buildAuthHeader, type StoredAuth } from "./auth.ts";
+import { Cache, TTL } from "./cache.ts";
 
-export interface AzureConfig {
-  org: string;
-  project: string;
-  pat: string;
-}
+export type { StoredAuth as AzureConfig };
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Work Items
@@ -28,6 +23,12 @@ export interface WorkItem {
   url: string;
 }
 
+export interface WorkItemAttachment {
+  name: string;
+  url: string;
+  comment?: string;
+}
+
 export interface WorkItemCreate {
   type: string;
   title: string;
@@ -43,6 +44,8 @@ export interface WorkItemCreate {
   remainingWork?: number;
   originalEstimate?: number;
   acceptanceCriteria?: string;
+  startDate?: string;
+  targetDate?: string;
   reproSteps?: string; // Bug-specific
   systemInfo?: string; // Bug-specific
   activity?: string; // Task activity type
@@ -63,6 +66,8 @@ export interface WorkItemUpdate {
   originalEstimate?: number;
   completedWork?: number;
   acceptanceCriteria?: string;
+  startDate?: string;
+  targetDate?: string;
   comment?: string; // Discussion comment / history entry
 }
 
@@ -127,6 +132,22 @@ export interface TeamMember {
     imageUrl: string;
   };
   isTeamAdmin: boolean;
+}
+
+export interface TeamCapacity {
+  teamMember: {
+    id: string;
+    displayName: string;
+    uniqueName: string;
+  };
+  activities: Array<{
+    name: string;
+    capacityPerDay: number;
+  }>;
+  daysOff: Array<{
+    start: string;
+    end: string;
+  }>;
 }
 
 export interface Iteration {
@@ -355,16 +376,19 @@ export class AzureDevOpsClient {
   private readonly base: string;
   private readonly vsrmBase: string;
   private readonly headers: Record<string, string>;
+  private readonly cfg: StoredAuth;
+  readonly cache: Cache;
 
-  constructor(private readonly cfg: AzureConfig) {
+  constructor(cfg: StoredAuth) {
+    this.cfg = cfg;
     this.base = `https://dev.azure.com/${cfg.org}`;
     this.vsrmBase = `https://vsrm.dev.azure.com/${cfg.org}`;
-    const token = Buffer.from(`:${cfg.pat}`).toString("base64");
     this.headers = {
-      Authorization: `Basic ${token}`,
+      Authorization: buildAuthHeader(cfg),
       "Content-Type": "application/json",
       Accept: "application/json",
     };
+    this.cache = new Cache();
   }
 
   // ── HTTP primitives ────────────────────────────────────────────────────────
@@ -439,15 +463,35 @@ export class AzureDevOpsClient {
   // ═══════════════════════════════════════════════════════════════════════════
 
   async getMyProfile(): Promise<UserProfile> {
-    return this.get<UserProfile>(
-      "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1",
+    return this.cache.getOrFetch("user", TTL.USER, () =>
+      this.get<UserProfile>(
+        "https://app.vssps.visualstudio.com/_apis/profile/profiles/me?api-version=7.1",
+      ),
     );
   }
 
   async getProjectInfo(): Promise<ProjectInfo> {
-    return this.get<ProjectInfo>(
-      `${this.base}/_apis/projects/${encodeURIComponent(this.cfg.project)}?includeCapabilities=true&api-version=7.1`,
+    return this.cache.getOrFetch(`project:${this.cfg.project}`, TTL.PROJECT, () =>
+      this.get<ProjectInfo>(
+        `${this.base}/_apis/projects/${encodeURIComponent(this.cfg.project)}?includeCapabilities=true&api-version=7.1`,
+      ),
     );
+  }
+
+  /** Download any URL with auth headers — used to fetch inline images from work item HTML. */
+  async downloadAttachment(url: string): Promise<{ data: string; mimeType: string } | null> {
+    try {
+      const res = await fetch(url, {
+        headers: { Authorization: this.headers["Authorization"]!, Accept: "*/*" },
+      });
+      if (!res.ok) return null;
+      const ct = res.headers.get("content-type") ?? "image/png";
+      const mimeType = ct.split(";")[0]?.trim() ?? "image/png";
+      const buf = await res.arrayBuffer();
+      return { data: Buffer.from(buf).toString("base64"), mimeType };
+    } catch {
+      return null;
+    }
   }
 
   async listProjects(): Promise<ProjectInfo[]> {
@@ -590,6 +634,10 @@ export class AzureDevOpsClient {
           input.acceptanceCriteria,
         ),
       );
+    if (input.startDate)
+      ops.push(field("Microsoft.VSTS.Scheduling.StartDate", input.startDate));
+    if (input.targetDate)
+      ops.push(field("Microsoft.VSTS.Scheduling.TargetDate", input.targetDate));
     if (input.reproSteps)
       ops.push(field("Microsoft.VSTS.TCM.ReproSteps", input.reproSteps));
     if (input.systemInfo)
@@ -662,6 +710,10 @@ export class AzureDevOpsClient {
           input.acceptanceCriteria,
         ),
       );
+    if (input.startDate)
+      ops.push(field("Microsoft.VSTS.Scheduling.StartDate", input.startDate));
+    if (input.targetDate)
+      ops.push(field("Microsoft.VSTS.Scheduling.TargetDate", input.targetDate));
     if (input.comment)
       ops.push({
         op: "add",
@@ -682,21 +734,42 @@ export class AzureDevOpsClient {
     );
   }
 
-  async listWorkItems(ids: number[]): Promise<WorkItem[]> {
+  async listWorkItemsById(ids: number[]): Promise<WorkItem[]> {
     if (ids.length === 0) return [];
     const chunks: number[][] = [];
-    for (let i = 0; i < ids.length; i += 200)
-      chunks.push(ids.slice(i, i + 200));
+    for (let i = 0; i < ids.length; i += 200) chunks.push(ids.slice(i, i + 200));
     const pages = await Promise.all(
       chunks.map((c) =>
         this.get<{ value: WorkItem[] }>(
-          this.apis(
-            `wit/workitems?ids=${c.join(",")}&$expand=all&api-version=7.1`,
-          ),
+          this.apis(`wit/workitems?ids=${c.join(",")}&$expand=all&api-version=7.1`),
         ).then((r) => r.value),
       ),
     );
     return pages.flat();
+  }
+
+  async listWorkItems(opts: {
+    assignedToMe?: boolean;
+    currentSprint?: boolean;
+    state?: string;
+    type?: string;
+    top?: number;
+    ids?: number[];
+  }): Promise<WorkItem[]> {
+    if (opts.ids) return this.listWorkItemsById(opts.ids);
+
+    const clauses: string[] = [`[System.TeamProject] = '${this.cfg.project}'`];
+    if (opts.assignedToMe) {
+      clauses.push("[System.AssignedTo] = @me");
+      clauses.push("[System.State] <> 'Closed'");
+    }
+    if (opts.currentSprint) clauses.push("[System.IterationPath] = @CurrentIteration");
+    if (opts.state) clauses.push(`[System.State] = '${opts.state}'`);
+    if (opts.type) clauses.push(`[System.WorkItemType] = '${opts.type}'`);
+
+    const wiql = `SELECT [System.Id] FROM WorkItems WHERE ${clauses.join(" AND ")} ORDER BY [System.ChangedDate] DESC`;
+    const r = await this.queryWiql(wiql, opts.top ?? 30);
+    return this.listWorkItemsById(r.workItems.map((w) => w.id));
   }
 
   // ── Comments ───────────────────────────────────────────────────────────────
@@ -779,7 +852,7 @@ export class AzureDevOpsClient {
     const r = await this.queryWiql(
       `SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${this.cfg.project}' AND [System.AssignedTo] = @me AND [System.State] <> 'Closed' ORDER BY [System.ChangedDate] DESC`,
     );
-    return this.listWorkItems(r.workItems.map((w) => w.id));
+    return this.listWorkItemsById(r.workItems.map((w) => w.id));
   }
 
   async queryByState(state: string, type?: string): Promise<WorkItem[]> {
@@ -787,14 +860,14 @@ export class AzureDevOpsClient {
     const r = await this.queryWiql(
       `SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${this.cfg.project}' AND [System.State] = '${state}'${typeFilter} ORDER BY [System.ChangedDate] DESC`,
     );
-    return this.listWorkItems(r.workItems.map((w) => w.id));
+    return this.listWorkItemsById(r.workItems.map((w) => w.id));
   }
 
   async queryCurrentSprint(): Promise<WorkItem[]> {
     const r = await this.queryWiql(
       `SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${this.cfg.project}' AND [System.IterationPath] = @CurrentIteration ORDER BY [System.WorkItemType] ASC`,
     );
-    return this.listWorkItems(r.workItems.map((w) => w.id));
+    return this.listWorkItemsById(r.workItems.map((w) => w.id));
   }
 
   async searchWorkItems(opts: {
@@ -817,7 +890,7 @@ export class AzureDevOpsClient {
       `SELECT [System.Id] FROM WorkItems WHERE ${clauses.join(" AND ")} ORDER BY [System.ChangedDate] DESC`,
       opts.top ?? 50,
     );
-    return this.listWorkItems(r.workItems.map((w) => w.id));
+    return this.listWorkItemsById(r.workItems.map((w) => w.id));
   }
 
   async listRecentWorkItems(type?: string, top = 30): Promise<WorkItem[]> {
@@ -826,7 +899,7 @@ export class AzureDevOpsClient {
       `SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = '${this.cfg.project}'${typeFilter} ORDER BY [System.ChangedDate] DESC`,
       top,
     );
-    return this.listWorkItems(r.workItems.map((w) => w.id));
+    return this.listWorkItemsById(r.workItems.map((w) => w.id));
   }
 
   async getWorkItemChildren(parentId: number): Promise<WorkItem[]> {
@@ -835,7 +908,22 @@ export class AzureDevOpsClient {
       .filter((r) => r.rel === "System.LinkTypes.Hierarchy-Forward")
       .map((r) => Number(r.url.split("/").pop()))
       .filter(Boolean);
-    return this.listWorkItems(ids);
+    return this.listWorkItemsById(ids);
+  }
+
+  async listWorkItemAttachments(id: number): Promise<WorkItemAttachment[]> {
+    const wi = await this.getWorkItem(id);
+    return (wi.relations ?? [])
+      .filter((r) => r.rel === "AttachedFile")
+      .map((r) => {
+        const attrs = r.attributes as { name?: string; comment?: string };
+        const guessed = decodeURIComponent(r.url.split("/").pop() ?? "");
+        return {
+          name: (attrs.name ?? guessed) || "attachment",
+          url: r.url,
+          comment: attrs.comment,
+        };
+      });
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -843,10 +931,12 @@ export class AzureDevOpsClient {
   // ═══════════════════════════════════════════════════════════════════════════
 
   async listTeams(): Promise<Team[]> {
-    const res = await this.get<{ value: Team[] }>(
-      `${this.base}/_apis/projects/${encodeURIComponent(this.cfg.project)}/teams?api-version=7.1`,
-    );
-    return res.value;
+    return this.cache.getOrFetch(`teams:${this.cfg.project}`, TTL.TEAMS, async () => {
+      const res = await this.get<{ value: Team[] }>(
+        `${this.base}/_apis/projects/${encodeURIComponent(this.cfg.project)}/teams?api-version=7.1`,
+      );
+      return res.value;
+    });
   }
 
   async getTeamMembers(team: string): Promise<TeamMember[]> {
@@ -869,13 +959,27 @@ export class AzureDevOpsClient {
   }
 
   async getCurrentIteration(team: string): Promise<Iteration | null> {
-    const res = await this.get<{ value: Iteration[] }>(
+    return this.cache.getOrFetch(`sprint:${this.cfg.project}:${team}`, TTL.SPRINT, async () => {
+      const res = await this.get<{ value: Iteration[] }>(
+        this.tapis(team, "work/teamsettings/iterations?$timeframe=current&api-version=7.1"),
+      );
+      return res.value[0] ?? null;
+    });
+  }
+
+  async listTeamCapacities(
+    team: string,
+    iterationId?: string,
+  ): Promise<TeamCapacity[]> {
+    const iterId = iterationId ?? (await this.getCurrentIteration(team))?.id;
+    if (!iterId) return [];
+    const res = await this.get<{ value: TeamCapacity[] }>(
       this.tapis(
         team,
-        "work/teamsettings/iterations?$timeframe=current&api-version=7.1",
+        `work/teamsettings/iterations/${encodeURIComponent(iterId)}/capacities?api-version=7.1`,
       ),
     );
-    return res.value[0] ?? null;
+    return res.value;
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -916,7 +1020,7 @@ export class AzureDevOpsClient {
     );
 
     const ids = res.workItems.map((w) => w.target.id);
-    const wis = await this.listWorkItems(ids);
+    const wis = await this.listWorkItemsById(ids);
     const orderMap = new Map(res.workItems.map((w) => [w.target.id, w.order]));
 
     return wis.map((wi) => ({
@@ -966,63 +1070,37 @@ export class AzureDevOpsClient {
   async listAreaPaths(): Promise<
     Array<{ id: string; name: string; path: string; hasChildren: boolean }>
   > {
-    type Node = {
-      id: string;
-      name: string;
-      path: string;
-      hasChildren: boolean;
-      children?: Node[];
-    };
-    const root = await this.get<Node>(
-      this.apis("wit/classificationnodes/areas?$depth=5&api-version=7.1"),
-    );
-    const acc: Node[] = [];
-    const flatten = (n: Node) => {
-      acc.push(n);
-      n.children?.forEach(flatten);
-    };
-    flatten(root);
-    return acc.map((n) => ({
-      id: n.id,
-      name: n.name,
-      path: n.path,
-      hasChildren: n.hasChildren,
-    }));
+    return this.cache.getOrFetch(`areas:${this.cfg.project}`, TTL.PATHS, async () => {
+      type Node = { id: string; name: string; path: string; hasChildren: boolean; children?: Node[] };
+      const root = await this.get<Node>(
+        this.apis("wit/classificationnodes/areas?$depth=5&api-version=7.1"),
+      );
+      const acc: Node[] = [];
+      const flatten = (n: Node) => { acc.push(n); n.children?.forEach(flatten); };
+      flatten(root);
+      return acc.map((n) => ({ id: n.id, name: n.name, path: n.path, hasChildren: n.hasChildren }));
+    });
   }
 
   async listIterationPaths(): Promise<
-    Array<{
-      id: string;
-      name: string;
-      path: string;
-      startDate?: string;
-      finishDate?: string;
-    }>
+    Array<{ id: string; name: string; path: string; startDate?: string; finishDate?: string }>
   > {
-    type Node = {
-      id: string;
-      name: string;
-      path: string;
-      hasChildren: boolean;
-      attributes?: { startDate?: string; finishDate?: string };
-      children?: Node[];
-    };
-    const root = await this.get<Node>(
-      this.apis("wit/classificationnodes/iterations?$depth=5&api-version=7.1"),
-    );
-    const acc: Node[] = [];
-    const flatten = (n: Node) => {
-      acc.push(n);
-      n.children?.forEach(flatten);
-    };
-    flatten(root);
-    return acc.map((n) => ({
-      id: n.id,
-      name: n.name,
-      path: n.path,
-      startDate: n.attributes?.startDate,
-      finishDate: n.attributes?.finishDate,
-    }));
+    return this.cache.getOrFetch(`iterations:${this.cfg.project}`, TTL.PATHS, async () => {
+      type Node = {
+        id: string; name: string; path: string; hasChildren: boolean;
+        attributes?: { startDate?: string; finishDate?: string }; children?: Node[];
+      };
+      const root = await this.get<Node>(
+        this.apis("wit/classificationnodes/iterations?$depth=5&api-version=7.1"),
+      );
+      const acc: Node[] = [];
+      const flatten = (n: Node) => { acc.push(n); n.children?.forEach(flatten); };
+      flatten(root);
+      return acc.map((n) => ({
+        id: n.id, name: n.name, path: n.path,
+        startDate: n.attributes?.startDate, finishDate: n.attributes?.finishDate,
+      }));
+    });
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
