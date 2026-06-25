@@ -14,7 +14,7 @@ import { AzureDevOpsClient } from "./client.ts";
 import { TOOLS, handleTool } from "./tools.ts";
 import { cmdInstall, cmdInstallSkill } from "./install.ts";
 
-const VERSION = "1.5.0";
+const VERSION = "1.6.0";
 const args = process.argv.slice(2);
 const [cmd] = args;
 

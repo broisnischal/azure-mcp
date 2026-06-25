@@ -142,7 +142,12 @@ AUTHENTICATE FLAGS
 
 ---
 
-## Tools (21)
+## Tools (30)
+
+> Work-item, commit, and PR lists are **paginated** — they return a compact page
+> (default 15, max 50) with a `Showing X–Y of N` header. Pass `skip` to page
+> through results instead of requesting a large `top`. List views fetch only the
+> fields they render, so they're fast and light on context.
 
 ### Auth & project
 | Tool | When to use |
@@ -153,13 +158,24 @@ AUTHENTICATE FLAGS
 ### Work items
 | Tool | When to use |
 |---|---|
-| `list_work_items` | My tasks, sprint board, filter by state/type/keyword |
+| `list_work_items` | My tasks, sprint board, filter by state/type/keyword (paginated) |
 | `get_work_item` | Full detail on a specific ticket — fields, comments, PRs |
 | `create_work_item` | Create a task, bug, user story, epic, feature |
 | `update_work_item` | Close, reassign, move sprint, update estimates |
 | `add_comment` | Post a note or status update on a ticket |
 | `link_work_items` | Set parent/child, related, or dependency links |
-| `query_wiql` | Advanced queries with custom WIQL |
+| `query_wiql` | Advanced queries with custom WIQL (paginated) |
+| `get_work_item_history` | Audit trail — which fields changed, when, by whom |
+| `get_backlog` | Ordered, priority-ranked product backlog |
+
+### Boards, sprints & teams
+| Tool | When to use |
+|---|---|
+| `get_sprint` | Current sprint dates and team capacity |
+| `list_sprints` | All sprints with start/end dates |
+| `get_board` | Kanban columns, state mappings, WIP limits |
+| `list_team_members` | Who's on a team (names, emails, admin flag) |
+| `list_paths` | Valid area / iteration path values for create/update |
 
 ### Repositories
 | Tool | When to use |
@@ -167,23 +183,21 @@ AUTHENTICATE FLAGS
 | `list_repos` | Discover repo names and URLs |
 | `list_files` | Browse directory structure |
 | `get_file` | Read file contents (up to 500 lines) |
-| `list_commits` | Recent commits on a branch |
-| `list_pull_requests` | Open PRs, reviewer votes, merge status |
+| `list_commits` | Recent commits on a branch (paginated) |
+| `list_pull_requests` | Open PRs, reviewer votes, merge status (paginated) |
 | `create_pr` | Open a PR with optional reviewers and linked work items |
 
-### Pipelines & builds
+### Pipelines, builds & releases
 | Tool | When to use |
 |---|---|
 | `list_pipelines` | Discover pipeline definitions |
 | `list_builds` | Recent builds — status, result, branch, link |
 | `run_pipeline` | Trigger a pipeline run |
-| `get_build_logs` | Diagnose build failures (last 150 lines) |
-
-### Sprints
-| Tool | When to use |
-|---|---|
-| `get_sprint` | Current sprint dates and team capacity |
-| `list_sprints` | All sprints with start/end dates |
+| `get_build_timeline` | Which stage/job/task failed, with error/warning counts |
+| `get_build_logs` | Diagnose build failures (build output) |
+| `cancel_build` | Cancel an in-progress build |
+| `list_releases` | Recent releases with per-environment deploy status |
+| `create_release` | Create and trigger a release from a definition |
 
 ---
 

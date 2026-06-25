@@ -5,7 +5,7 @@ description: Configure and use the Azure DevOps MCP server (azure-board-mcp) wit
 
 # Azure DevOps MCP
 
-9-tool MCP server for Azure DevOps: work items, sprints, builds, and pull requests over stdio.  
+30-tool MCP server for Azure DevOps: work items, backlog, boards, sprints, repos, PRs, builds, and releases over stdio.  
 Installable via `npx` or `bunx` — no clone required.
 
 ## Install & authenticate
@@ -68,19 +68,37 @@ Or with bunx:
 
 Credentials from `~/.azure-mcp-auth.json` are picked up automatically.
 
-## Available tools (9)
+## Available tools (30)
+
+Work-item, commit, and PR lists are **paginated** (default page 15, max 50) and
+report `Showing X–Y of N`; pass `skip` to page through rather than a large `top`.
 
 | Tool | What it does |
 |---|---|
 | `auth_status` | Validate credentials and check PAT scopes |
+| `switch_project` | List projects / set the active one |
 | `list_work_items` | List/filter work items (mine, sprint, state, keyword) |
 | `get_work_item` | Full detail: description, acceptance criteria, repro steps, comments, linked PRs/commits/builds |
 | `create_work_item` | Create any work item type |
 | `update_work_item` | Update fields or append a comment |
 | `add_comment` | Post a discussion comment |
+| `link_work_items` | Parent/child, related, dependency links |
 | `query_wiql` | Raw WIQL for custom queries |
-| `list_builds` | List CI builds with status and URL |
+| `get_work_item_history` | Audit trail — which fields changed, when, by whom |
+| `get_backlog` | Ordered, priority-ranked backlog |
+| `get_sprint` / `list_sprints` | Sprint dates and team capacity |
+| `get_board` | Kanban columns, state mappings, WIP limits |
+| `list_team_members` | Team roster (names, emails, admin flag) |
+| `list_paths` | Valid area / iteration path values |
+| `list_repos` / `list_files` / `get_file` | Browse repositories and files |
+| `list_commits` | Recent commits on a branch |
 | `list_pull_requests` | List PRs with reviewer votes |
+| `create_pr` | Open a PR with reviewers + linked work items |
+| `list_pipelines` / `list_builds` / `run_pipeline` | CI/CD pipelines and builds |
+| `get_build_timeline` | Which stage/job/task failed |
+| `get_build_logs` | Build output for diagnosing failures |
+| `cancel_build` | Cancel an in-progress build |
+| `list_releases` / `create_release` | Release status and triggering |
 
 ## Common workflows
 

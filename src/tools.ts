@@ -204,10 +204,50 @@ function fmtWIFull(wi: WorkItem, comments: Array<{ createdBy: { displayName: str
     .join("\n");
 }
 
-const fmtList = (items: WorkItem[]) =>
-  items.length === 0
-    ? "No results."
-    : `${items.length} item(s):\n\n${items.map(fmtWI).join("\n\n───\n\n")}`;
+/** Hard ceiling on page size so a single call can't flood context. */
+const MAX_PAGE = 50;
+const DEFAULT_PAGE = 15;
+
+/** Clamp a user-supplied page size into [1, MAX_PAGE]. */
+function pageSize(top: number | undefined): number {
+  if (top == null) return DEFAULT_PAGE;
+  return Math.min(MAX_PAGE, Math.max(1, Math.floor(top)));
+}
+
+/**
+ * Render a page of work items with a "showing X–Y of N" header and a next-page
+ * hint, so the model can fetch more deliberately instead of dumping everything.
+ */
+function fmtPage(
+  items: WorkItem[],
+  total: number,
+  skip: number,
+  capped = false,
+): string {
+  if (total === 0) return "No results.";
+  const start = skip + 1;
+  const end = skip + items.length;
+  const totalLabel = capped ? `${total}+` : `${total}`;
+  const header = `Showing ${start}–${end} of ${totalLabel}`;
+  const body = items.map(fmtWI).join("\n\n───\n\n");
+  const more =
+    end < total
+      ? `\n\n— ${capped ? "more" : `${total - end} more`} available. Call again with skip: ${end} for the next page.`
+      : "";
+  return `${header}:\n\n${body}${more}`;
+}
+
+/**
+ * Wrap a pre-formatted list body with a "showing X–Y" header and a next-page
+ * hint for endpoints that page by offset but don't return a total (commits,
+ * PRs). A full page implies more may exist; a short page is the end.
+ */
+function fmtOffsetPage(body: string, count: number, skip: number, top: number): string {
+  const header = `Showing ${skip + 1}–${skip + count}`;
+  const more =
+    count >= top ? `\n\n— more may be available. Call again with skip: ${skip + count}.` : "";
+  return `${header}:\n\n${body}${more}`;
+}
 
 const str = (a: Record<string, unknown>, k: string) => a[k] as string;
 const num = (a: Record<string, unknown>, k: string) => a[k] as number;
@@ -223,6 +263,7 @@ const WI_TYPES = ["Task", "Bug", "User Story", "Epic", "Feature", "Issue", "Test
 const PR_STATUSES = ["active", "completed", "abandoned", "all"];
 const BUILD_STATUSES = ["all", "inProgress", "completed", "notStarted"];
 const BUILD_RESULTS = ["succeeded", "failed", "canceled", "partiallySucceeded"];
+const RELEASE_STATUSES = ["draft", "active", "abandoned"];
 const LINK_TYPES = [
   "System.LinkTypes.Hierarchy-Forward",   // parent → child
   "System.LinkTypes.Hierarchy-Reverse",   // child → parent
@@ -256,7 +297,8 @@ export const TOOLS: Tool[] = [
         state: { type: "string", enum: WI_STATES },
         type: { type: "string", enum: WI_TYPES },
         keyword: { type: "string", description: "Search title and description" },
-        top: { type: "number", description: "Max results (default 15)" },
+        top: { type: "number", description: "Page size (default 15, max 50)" },
+        skip: { type: "number", description: "Skip N results for pagination (default 0)" },
       },
     },
   },
@@ -348,7 +390,8 @@ export const TOOLS: Tool[] = [
       type: "object",
       properties: {
         wiql: { type: "string" },
-        top: { type: "number", description: "Max results (default 50)" },
+        top: { type: "number", description: "Page size (default 15, max 50)" },
+        skip: { type: "number", description: "Skip N results for pagination (default 0)" },
       },
       required: ["wiql"],
     },
@@ -366,7 +409,8 @@ export const TOOLS: Tool[] = [
       properties: {
         repo: { type: "string" },
         branch: { type: "string" },
-        top: { type: "number", description: "Default 20" },
+        top: { type: "number", description: "Page size (default 20, max 50)" },
+        skip: { type: "number", description: "Skip N commits for pagination (default 0)" },
       },
       required: ["repo"],
     },
@@ -405,6 +449,8 @@ export const TOOLS: Tool[] = [
       properties: {
         repo: { type: "string" },
         status: { type: "string", enum: PR_STATUSES, description: "Default: active" },
+        top: { type: "number", description: "Page size (default 20, max 50)" },
+        skip: { type: "number", description: "Skip N PRs for pagination (default 0)" },
       },
       required: ["repo"],
     },
@@ -487,6 +533,103 @@ export const TOOLS: Tool[] = [
       properties: { team: { type: "string", description: "Default: first team" } },
     },
   },
+  {
+    name: "get_backlog",
+    description: "Show the ordered product backlog (priority-ranked work items).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        team: { type: "string", description: "Default: first team" },
+        level: { type: "string", description: "Backlog level (e.g. Microsoft.RequirementCategory, Microsoft.EpicCategory). Omit for default." },
+        top: { type: "number", description: "Page size (default 20, max 50)" },
+        skip: { type: "number", description: "Skip N for pagination (default 0)" },
+      },
+    },
+  },
+  {
+    name: "get_work_item_history",
+    description: "Show the change history of a work item — what fields changed, when, and by whom.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "number", description: "Work item ID" },
+        top: { type: "number", description: "Most recent N revisions (default 15)" },
+      },
+      required: ["id"],
+    },
+  },
+  {
+    name: "list_team_members",
+    description: "List members of a team (display name, email, admin flag).",
+    inputSchema: {
+      type: "object",
+      properties: { team: { type: "string", description: "Default: first team" } },
+    },
+  },
+  {
+    name: "list_paths",
+    description: "List area or iteration paths — use these exact values for areaPath/iterationPath on create/update.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        kind: { type: "string", enum: ["area", "iteration"], description: "Which path tree to list" },
+      },
+      required: ["kind"],
+    },
+  },
+  {
+    name: "get_board",
+    description: "Show a team's Kanban board columns and their state mappings.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        team: { type: "string", description: "Default: first team" },
+        board: { type: "string", description: "Board name/id (omit for first board)" },
+      },
+    },
+  },
+  {
+    name: "get_build_timeline",
+    description: "Show a build's step-by-step timeline — which stage/job/task failed, with error/warning counts.",
+    inputSchema: {
+      type: "object",
+      properties: { buildId: { type: "number" } },
+      required: ["buildId"],
+    },
+  },
+  {
+    name: "cancel_build",
+    description: "Cancel an in-progress build run.",
+    inputSchema: {
+      type: "object",
+      properties: { buildId: { type: "number" } },
+      required: ["buildId"],
+    },
+  },
+  {
+    name: "list_releases",
+    description: "List recent releases with environment deployment status.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        definitionId: { type: "number", description: "Filter by release definition" },
+        status: { type: "string", enum: RELEASE_STATUSES },
+        top: { type: "number", description: "Default 10" },
+      },
+    },
+  },
+  {
+    name: "create_release",
+    description: "Create (and trigger) a release from a release definition.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        definitionId: { type: "number" },
+        description: { type: "string" },
+      },
+      required: ["definitionId"],
+    },
+  },
 ];
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -562,29 +705,18 @@ export async function handleTool(
       // ── Work items ───────────────────────────────────────────────────────────
       case "list_work_items": {
         const keyword = opt<string>(args, "keyword");
-        if (keyword) {
-          return ok(
-            fmtList(
-              await client.searchWorkItems({
-                keyword,
-                state: opt(args, "state"),
-                type: opt(args, "type"),
-                top: opt<number>(args, "top") ?? 15,
-              }),
-            ),
-          );
-        }
-        return ok(
-          fmtList(
-            await client.listWorkItems({
+        const top = pageSize(opt<number>(args, "top"));
+        const skip = Math.max(0, opt<number>(args, "skip") ?? 0);
+        const wiql = keyword
+          ? client.buildSearchWiql({ keyword, state: opt(args, "state"), type: opt(args, "type") })
+          : client.buildListWiql({
               assignedToMe: opt<boolean>(args, "mine"),
               currentSprint: opt<boolean>(args, "sprint"),
               state: opt(args, "state"),
               type: opt(args, "type"),
-              top: opt<number>(args, "top") ?? 15,
-            }),
-          ),
-        );
+            });
+        const { items, total, capped } = await client.pagedWorkItems(wiql, { skip, top });
+        return ok(fmtPage(items, total, skip, capped));
       }
 
       case "get_work_item": {
@@ -680,9 +812,11 @@ export async function handleTool(
       }
 
       case "query_wiql": {
-        const r = await client.queryWiql(str(args, "wiql"), opt<number>(args, "top") ?? 50);
-        if (r.workItems.length === 0) return ok("Query returned 0 results.");
-        return ok(fmtList(await client.listWorkItemsById(r.workItems.map((w) => w.id))));
+        const top = pageSize(opt<number>(args, "top"));
+        const skip = Math.max(0, opt<number>(args, "skip") ?? 0);
+        const { items, total, capped } = await client.pagedWorkItems(str(args, "wiql"), { skip, top });
+        if (total === 0) return ok("Query returned 0 results.");
+        return ok(fmtPage(items, total, skip, capped));
       }
 
       // ── Builds ───────────────────────────────────────────────────────────────
@@ -724,28 +858,31 @@ export async function handleTool(
 
       // ── Pull requests ─────────────────────────────────────────────────────────
       case "list_pull_requests": {
+        const top = pageSize(opt<number>(args, "top") ?? 20);
+        const skip = Math.max(0, opt<number>(args, "skip") ?? 0);
         const prs = await client.listPullRequests(
           str(args, "repo"),
           (opt(args, "status") ?? "active") as "active" | "completed" | "abandoned" | "all",
+          top,
+          skip,
         );
-        if (prs.length === 0) return ok("No pull requests found.");
-        return ok(
-          prs
-            .map((pr) =>
-              [
-                `#${pr.pullRequestId} [${pr.status}${pr.isDraft ? "/draft" : ""}] ${pr.title}`,
-                `  By:     ${pr.createdBy.displayName}`,
-                `  Branch: ${pr.sourceRefName.replace("refs/heads/", "")} → ${pr.targetRefName.replace("refs/heads/", "")}`,
-                `  Merge:  ${pr.mergeStatus}`,
-                pr.reviewers.length
-                  ? `  Votes:  ${pr.reviewers.map((r) => `${r.displayName}:${r.vote > 0 ? "approved" : r.vote < 0 ? "rejected" : "pending"}`).join(", ")}`
-                  : "",
-              ]
-                .filter(Boolean)
-                .join("\n"),
-            )
-            .join("\n\n"),
-        );
+        if (prs.length === 0) return ok(skip > 0 ? "No more pull requests." : "No pull requests found.");
+        const body = prs
+          .map((pr) =>
+            [
+              `#${pr.pullRequestId} [${pr.status}${pr.isDraft ? "/draft" : ""}] ${pr.title}`,
+              `  By:     ${pr.createdBy.displayName}`,
+              `  Branch: ${pr.sourceRefName.replace("refs/heads/", "")} → ${pr.targetRefName.replace("refs/heads/", "")}`,
+              `  Merge:  ${pr.mergeStatus}`,
+              pr.reviewers.length
+                ? `  Votes:  ${pr.reviewers.map((r) => `${r.displayName}:${r.vote > 0 ? "approved" : r.vote < 0 ? "rejected" : "pending"}`).join(", ")}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+          )
+          .join("\n\n");
+        return ok(fmtOffsetPage(body, prs.length, skip, top));
       }
 
       case "create_pr": {
@@ -789,17 +926,19 @@ export async function handleTool(
       }
 
       case "list_commits": {
+        const top = pageSize(opt<number>(args, "top") ?? 20);
+        const skip = Math.max(0, opt<number>(args, "skip") ?? 0);
         const commits = await client.listCommits(
           str(args, "repo"),
           opt<string>(args, "branch"),
-          opt<number>(args, "top") ?? 20,
+          top,
+          skip,
         );
-        if (commits.length === 0) return ok("No commits found.");
-        return ok(
-          commits.map((c) =>
-            `${c.commitId.slice(0, 8)}  ${c.author.date.slice(0, 10)}  ${c.author.name}\n  ${c.comment.split("\n")[0]}`
-          ).join("\n"),
-        );
+        if (commits.length === 0) return ok(skip > 0 ? "No more commits." : "No commits found.");
+        const body = commits.map((c) =>
+          `${c.commitId.slice(0, 8)}  ${c.author.date.slice(0, 10)}  ${c.author.name}\n  ${c.comment.split("\n")[0]}`
+        ).join("\n");
+        return ok(fmtOffsetPage(body, commits.length, skip, top));
       }
 
       case "get_file": {
@@ -922,6 +1061,208 @@ export async function handleTool(
             return `${it.name}  (${start} → ${end})`;
           }).join("\n"),
         );
+      }
+
+      // ── Backlog ────────────────────────────────────────────────────────────
+      case "get_backlog": {
+        const teams = await client.listTeams();
+        const teamName = opt<string>(args, "team") ?? teams[0]?.name;
+        if (!teamName) return ok("No teams found in this project.");
+        const top = pageSize(opt<number>(args, "top") ?? 20);
+        const skip = Math.max(0, opt<number>(args, "skip") ?? 0);
+        const all = await client.getBacklog(teamName, opt<string>(args, "level"));
+        if (all.length === 0) return ok("Backlog is empty.");
+        const page = all.slice(skip, skip + top);
+        const body = page
+          .map((b, i) => {
+            const rank = skip + i + 1;
+            const meta = [
+              b.assignedTo !== "Unassigned" ? `@${b.assignedTo}` : null,
+              b.storyPoints != null ? `${b.storyPoints}pts` : null,
+              b.priority != null ? `P${b.priority}` : null,
+            ].filter(Boolean).join(" · ");
+            return `${rank}. #${b.id} [${b.type}/${b.state}] ${b.title}${meta ? `  — ${meta}` : ""}`;
+          })
+          .join("\n");
+        const more = skip + page.length < all.length
+          ? `\n\n— ${all.length - skip - page.length} more. Call again with skip: ${skip + page.length}.`
+          : "";
+        return ok(`Backlog for "${teamName}" — ${all.length} item(s):\n\n${body}${more}`);
+      }
+
+      // ── Work item history ──────────────────────────────────────────────────
+      case "get_work_item_history": {
+        const top = opt<number>(args, "top") ?? 15;
+        const updates = await client.getWorkItemHistory(num(args, "id"));
+        // Most recent first, keep only revisions that actually changed a field.
+        const meaningful = updates
+          .filter((u) => Object.keys(u.fields).length > 0)
+          .reverse()
+          .slice(0, top);
+        if (meaningful.length === 0) return ok("No change history.");
+        const SKIP = new Set([
+          "System.Rev", "System.AuthorizedDate", "System.RevisedDate",
+          "System.ChangedDate", "System.Watermark", "System.AuthorizedAs",
+          "System.PersonId", "System.ChangedBy",
+        ]);
+        const short = (k: string) => k.split(".").pop() ?? k;
+        const val = (v: unknown) => {
+          if (v == null || v === "") return "—";
+          const s = typeof v === "object" && v && "displayName" in v
+            ? String((v as { displayName: string }).displayName)
+            : stripHtml(String(v));
+          return s.length > 80 ? s.slice(0, 80) + "…" : s;
+        };
+        const blocks = meaningful.map((u) => {
+          const who = u.revisedBy?.displayName ?? "—";
+          const when = u.revisedDate?.slice(0, 16).replace("T", " ") ?? "—";
+          const changes = Object.entries(u.fields)
+            .filter(([k]) => !SKIP.has(k))
+            .map(([k, d]) => `  ${short(k)}: ${val(d.oldValue)} → ${val(d.newValue)}`);
+          return changes.length
+            ? `[${when}] ${who}\n${changes.join("\n")}`
+            : null;
+        }).filter(Boolean);
+        return ok(blocks.length ? blocks.join("\n\n") : "No field changes in recent history.");
+      }
+
+      // ── Teams & paths ──────────────────────────────────────────────────────
+      case "list_team_members": {
+        const teams = await client.listTeams();
+        const teamName = opt<string>(args, "team") ?? teams[0]?.name;
+        if (!teamName) return ok("No teams found in this project.");
+        const members = await client.getTeamMembers(teamName);
+        if (members.length === 0) return ok(`No members in team "${teamName}".`);
+        return ok(
+          `Team "${teamName}" — ${members.length} member(s):\n\n` +
+          members.map((m) =>
+            `${m.identity.displayName}${m.isTeamAdmin ? " (admin)" : ""}  <${m.identity.uniqueName}>`
+          ).join("\n"),
+        );
+      }
+
+      case "list_paths": {
+        const kind = str(args, "kind");
+        if (kind === "iteration") {
+          const paths = await client.listIterationPaths();
+          if (paths.length === 0) return ok("No iteration paths found.");
+          return ok(
+            `Iteration paths (${paths.length}):\n\n` +
+            paths.map((p) => {
+              const dates = p.startDate || p.finishDate
+                ? `  (${p.startDate?.slice(0, 10) ?? "?"} → ${p.finishDate?.slice(0, 10) ?? "?"})`
+                : "";
+              return `${p.path}${dates}`;
+            }).join("\n"),
+          );
+        }
+        const paths = await client.listAreaPaths();
+        if (paths.length === 0) return ok("No area paths found.");
+        return ok(`Area paths (${paths.length}):\n\n` + paths.map((p) => p.path).join("\n"));
+      }
+
+      case "get_board": {
+        const teams = await client.listTeams();
+        const teamName = opt<string>(args, "team") ?? teams[0]?.name;
+        if (!teamName) return ok("No teams found in this project.");
+        const boards = await client.listBoards(teamName);
+        if (boards.length === 0) return ok(`No boards for team "${teamName}".`);
+        const wanted = opt<string>(args, "board");
+        const board = wanted
+          ? boards.find((b) => b.name.toLowerCase() === wanted.toLowerCase() || b.id === wanted) ?? boards[0]!
+          : boards[0]!;
+        const detail = await client.getBoard(teamName, board.id);
+        return ok(
+          `Board "${detail.name}" (team ${teamName}):\n\n` +
+          detail.columns.map((c) => {
+            const states = Object.entries(c.stateMappings).map(([wit, st]) => `${wit}→${st}`).join(", ");
+            const limit = c.itemLimit > 0 ? `  [WIP ${c.itemLimit}]` : "";
+            return `│ ${c.name}${limit}${states ? `\n│   ${states}` : ""}`;
+          }).join("\n"),
+        );
+      }
+
+      // ── Build timeline & cancel ──────────────────────────────────────────────
+      case "get_build_timeline": {
+        const timeline = await client.getBuildTimeline(num(args, "buildId"));
+        const records = timeline.records ?? [];
+        if (records.length === 0) return ok("No timeline available (build may not have started).");
+        const icon = (r: { state: string; result: string | null }) =>
+          r.result === "succeeded" ? "✅"
+          : r.result === "failed" ? "❌"
+          : r.result === "canceled" ? "⏹"
+          : r.state === "inProgress" ? "🔄"
+          : "○";
+        // Sort by type depth (Stage → Phase → Job → Task) then start time.
+        const order: Record<string, number> = { Stage: 0, Phase: 1, Job: 2, Task: 3 };
+        const sorted = [...records].sort((a, b) =>
+          (order[a.type] ?? 9) - (order[b.type] ?? 9) ||
+          (a.startTime ?? "").localeCompare(b.startTime ?? ""),
+        );
+        const lines = sorted.map((r) => {
+          const dur = r.startTime && r.finishTime
+            ? `${Math.round((new Date(r.finishTime).getTime() - new Date(r.startTime).getTime()) / 1000)}s`
+            : "";
+          const issues = [
+            r.errorCount ? `${r.errorCount} err` : null,
+            r.warningCount ? `${r.warningCount} warn` : null,
+          ].filter(Boolean).join(", ");
+          const indent = "  ".repeat(order[r.type] ?? 0);
+          return `${icon(r)} ${indent}${r.name}${dur ? `  (${dur})` : ""}${issues ? `  [${issues}]` : ""}`;
+        });
+        const failed = sorted.filter((r) => r.result === "failed");
+        const header = failed.length
+          ? `Build #${num(args, "buildId")} — ${failed.length} failed step(s): ${failed.map((f) => f.name).join(", ")}\n\n`
+          : `Build #${num(args, "buildId")} timeline:\n\n`;
+        return ok(header + lines.join("\n"));
+      }
+
+      case "cancel_build": {
+        await client.cancelBuild(num(args, "buildId"));
+        return ok(`Build #${num(args, "buildId")} cancellation requested.`);
+      }
+
+      // ── Releases ─────────────────────────────────────────────────────────────
+      case "list_releases": {
+        const releases = await client.listReleases({
+          definitionId: opt<number>(args, "definitionId"),
+          status: opt<"draft" | "active" | "abandoned">(args, "status"),
+          top: opt<number>(args, "top") ?? 10,
+        });
+        if (releases.length === 0) return ok("No releases found.");
+        return ok(
+          releases.map((r) => {
+            const envs = r.environments.map((e) => {
+              const i = e.status === "succeeded" ? "✅"
+                : e.status === "failed" || e.status === "rejected" ? "❌"
+                : e.status === "inProgress" ? "🔄"
+                : e.status === "notStarted" ? "○"
+                : "·";
+              return `${i} ${e.name}`;
+            }).join("  ");
+            return [
+              `#${r.id} ${r.name} [${r.status}]`,
+              `  Def:  ${r.releaseDefinition.name}`,
+              `  By:   ${r.createdBy.displayName} · ${r.createdOn.slice(0, 10)}`,
+              `  Envs: ${envs || "—"}`,
+              `  URL:  ${r._links.web.href}`,
+            ].join("\n");
+          }).join("\n\n"),
+        );
+      }
+
+      case "create_release": {
+        const r = await client.createRelease(
+          num(args, "definitionId"),
+          opt<string>(args, "description"),
+        );
+        return ok([
+          `Release created:`,
+          `  #${r.id}  ${r.name}`,
+          `  Definition: ${r.releaseDefinition.name}`,
+          `  Status:     ${r.status}`,
+          `  URL:        ${r._links.web.href}`,
+        ].join("\n"));
       }
 
       default:

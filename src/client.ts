@@ -368,6 +368,51 @@ function field(name: string, value: unknown): PatchOp {
   return { op: "add", path: `/fields/${name}`, value };
 }
 
+/**
+ * Minimal field set for list/search views — everything `fmtWI` renders, nothing
+ * more. Fetching these via `fields=` instead of `$expand=all` cuts the response
+ * payload by an order of magnitude (no rich-text bodies, no relations), making
+ * list calls both faster and far lighter on context.
+ */
+export const LIST_FIELDS = [
+  "System.Id",
+  "System.Title",
+  "System.WorkItemType",
+  "System.State",
+  "System.AssignedTo",
+  "System.IterationPath",
+  "Microsoft.VSTS.Scheduling.StoryPoints",
+  "Microsoft.VSTS.Common.Priority",
+] as const;
+
+/** Max work-item IDs fetched per WIQL query when paginating (IDs are cheap). */
+const WIQL_ID_CAP = 500;
+
+// ── Transient-failure retry ───────────────────────────────────────────────────
+// Azure DevOps throttles aggressively (429) and occasionally returns gateway
+// errors. These are transient — retry with exponential backoff + jitter rather
+// than surfacing a hard failure to the model.
+const RETRYABLE = new Set([429, 502, 503, 504]);
+const MAX_RETRIES = 3;
+const BACKOFF_BASE_MS = 300;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Exponential backoff with jitter: ~300ms, ~600ms, ~1200ms (±25%). */
+function backoffMs(attempt: number): number {
+  const base = BACKOFF_BASE_MS * 2 ** attempt;
+  return Math.round(base * (0.75 + Math.random() * 0.5));
+}
+
+/**
+ * Escape a value for safe interpolation into a single-quoted WIQL string
+ * literal. WIQL escapes a quote by doubling it. Prevents a stray apostrophe in
+ * a keyword (e.g. "user's bug") from breaking the query or injecting clauses.
+ */
+function wiqlEsc(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Client
 // ═════════════════════════════════════════════════════════════════════════════
@@ -416,8 +461,40 @@ export class AzureDevOpsClient {
 
   // ── HTTP primitives ────────────────────────────────────────────────────────
 
+  /**
+   * fetch() with automatic retry on transient failures (429 + gateway errors)
+   * and network exceptions. Honors the `Retry-After` header when present,
+   * otherwise falls back to exponential backoff. Returns the final Response —
+   * callers handle non-retryable error statuses themselves.
+   */
+  private async request(url: string, init?: RequestInit): Promise<Response> {
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        const res = await fetch(url, init);
+        if (RETRYABLE.has(res.status) && attempt < MAX_RETRIES) {
+          const retryAfter = Number(res.headers.get("retry-after"));
+          const delay =
+            Number.isFinite(retryAfter) && retryAfter > 0
+              ? retryAfter * 1000
+              : backoffMs(attempt);
+          await sleep(delay);
+          continue;
+        }
+        return res;
+      } catch (e) {
+        lastErr = e; // network error — retry
+        if (attempt >= MAX_RETRIES) break;
+        await sleep(backoffMs(attempt));
+      }
+    }
+    throw lastErr instanceof Error
+      ? lastErr
+      : new Error(`Request to ${url} failed after ${MAX_RETRIES} retries`);
+  }
+
   private async get<T>(url: string): Promise<T> {
-    const res = await fetch(url, { headers: this.headers });
+    const res = await this.request(url, { headers: this.headers });
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`GET ${url} → ${res.status}: ${body}`);
@@ -430,7 +507,7 @@ export class AzureDevOpsClient {
     body: unknown,
     extraHeaders?: Record<string, string>,
   ): Promise<T> {
-    const res = await fetch(url, {
+    const res = await this.request(url, {
       method: "POST",
       headers: { ...this.headers, ...extraHeaders },
       body: JSON.stringify(body),
@@ -447,7 +524,7 @@ export class AzureDevOpsClient {
     body: unknown,
     contentType?: string,
   ): Promise<T> {
-    const res = await fetch(url, {
+    const res = await this.request(url, {
       method: "PATCH",
       headers: {
         ...this.headers,
@@ -463,7 +540,7 @@ export class AzureDevOpsClient {
   }
 
   private async del(url: string): Promise<void> {
-    const res = await fetch(url, { method: "DELETE", headers: this.headers });
+    const res = await this.request(url, { method: "DELETE", headers: this.headers });
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`DELETE ${url} → ${res.status}: ${text}`);
@@ -505,7 +582,7 @@ export class AzureDevOpsClient {
   /** Download any URL with auth headers — used to fetch inline images from work item HTML. */
   async downloadAttachment(url: string): Promise<{ data: string; mimeType: string } | null> {
     try {
-      const res = await fetch(url, {
+      const res = await this.request(url, {
         headers: { Authorization: this.headers["Authorization"]!, Accept: "*/*" },
       });
       if (!res.ok) return null;
@@ -758,18 +835,98 @@ export class AzureDevOpsClient {
     );
   }
 
-  async listWorkItemsById(ids: number[]): Promise<WorkItem[]> {
+  /**
+   * Batch-fetch work items by ID. Pass `fields` to project only specific fields
+   * (much smaller payload); omit it for the full `$expand=all` view (all fields
+   * + relations) used by detail views. Results preserve the requested ID order.
+   */
+  async listWorkItemsById(
+    ids: number[],
+    opts: { fields?: readonly string[] } = {},
+  ): Promise<WorkItem[]> {
     if (ids.length === 0) return [];
+    const select = opts.fields?.length
+      ? `fields=${opts.fields.join(",")}&errorPolicy=omit`
+      : "$expand=all";
     const chunks: number[][] = [];
     for (let i = 0; i < ids.length; i += 200) chunks.push(ids.slice(i, i + 200));
     const pages = await Promise.all(
       chunks.map((c) =>
         this.get<{ value: WorkItem[] }>(
-          this.apis(`wit/workitems?ids=${c.join(",")}&$expand=all&api-version=7.1`),
+          this.apis(`wit/workitems?ids=${c.join(",")}&${select}&api-version=7.1`),
         ).then((r) => r.value),
       ),
     );
-    return pages.flat();
+    const all = pages.flat();
+    // The batch endpoint may not honor request order — re-sort to match `ids`.
+    const byId = new Map(all.map((w) => [w.id, w]));
+    return ids.map((id) => byId.get(id)).filter((w): w is WorkItem => w != null);
+  }
+
+  /** Build the WIQL SELECT for the list_work_items filter set. */
+  buildListWiql(opts: {
+    assignedToMe?: boolean;
+    currentSprint?: boolean;
+    state?: string;
+    type?: string;
+  }): string {
+    const clauses: string[] = [`[System.TeamProject] = '${wiqlEsc(this.cfg.project ?? "")}'`];
+    if (opts.assignedToMe) {
+      clauses.push("[System.AssignedTo] = @me");
+      clauses.push("[System.State] <> 'Closed'");
+    }
+    if (opts.currentSprint) clauses.push("[System.IterationPath] = @CurrentIteration");
+    if (opts.state) clauses.push(`[System.State] = '${wiqlEsc(opts.state)}'`);
+    if (opts.type) clauses.push(`[System.WorkItemType] = '${wiqlEsc(opts.type)}'`);
+    return `SELECT [System.Id] FROM WorkItems WHERE ${clauses.join(" AND ")} ORDER BY [System.ChangedDate] DESC`;
+  }
+
+  /** Build the WIQL SELECT for the keyword search. */
+  buildSearchWiql(opts: {
+    keyword: string;
+    type?: string;
+    state?: string;
+    assignedTo?: string;
+  }): string {
+    const kw = wiqlEsc(opts.keyword);
+    const clauses: string[] = [
+      `[System.TeamProject] = '${wiqlEsc(this.cfg.project ?? "")}'`,
+      `([System.Title] CONTAINS '${kw}' OR [System.Description] CONTAINS '${kw}')`,
+    ];
+    if (opts.type) clauses.push(`[System.WorkItemType] = '${wiqlEsc(opts.type)}'`);
+    if (opts.state) clauses.push(`[System.State] = '${wiqlEsc(opts.state)}'`);
+    if (opts.assignedTo) clauses.push(`[System.AssignedTo] = '${wiqlEsc(opts.assignedTo)}'`);
+    return `SELECT [System.Id] FROM WorkItems WHERE ${clauses.join(" AND ")} ORDER BY [System.ChangedDate] DESC`;
+  }
+
+  /**
+   * Run a WIQL query and return the matching IDs, cached briefly so paging
+   * through a result set doesn't re-hit the API on every page turn.
+   */
+  async queryWiqlIds(wiql: string, cap = WIQL_ID_CAP): Promise<number[]> {
+    return this.cache.getOrFetch(`wiql:${cap}:${wiql}`, TTL.WI_LIST, async () => {
+      const r = await this.queryWiql(wiql, cap);
+      return r.workItems.map((w) => w.id);
+    });
+  }
+
+  /**
+   * Paginated work-item fetch: query IDs once (cheap + cached), slice to the
+   * requested page, then hydrate ONLY that page with the compact field set.
+   * Returns the page plus the total match count for "showing X of N" output.
+   */
+  async pagedWorkItems(
+    wiql: string,
+    opts: { skip?: number; top?: number; fields?: readonly string[] } = {},
+  ): Promise<{ items: WorkItem[]; total: number; skip: number; capped: boolean }> {
+    const ids = await this.queryWiqlIds(wiql);
+    const skip = Math.max(0, opts.skip ?? 0);
+    const top = Math.max(1, opts.top ?? 15);
+    const page = ids.slice(skip, skip + top);
+    const items = await this.listWorkItemsById(page, {
+      fields: opts.fields ?? LIST_FIELDS,
+    });
+    return { items, total: ids.length, skip, capped: ids.length >= WIQL_ID_CAP };
   }
 
   async listWorkItems(opts: {
@@ -780,20 +937,9 @@ export class AzureDevOpsClient {
     top?: number;
     ids?: number[];
   }): Promise<WorkItem[]> {
-    if (opts.ids) return this.listWorkItemsById(opts.ids);
-
-    const clauses: string[] = [`[System.TeamProject] = '${this.cfg.project}'`];
-    if (opts.assignedToMe) {
-      clauses.push("[System.AssignedTo] = @me");
-      clauses.push("[System.State] <> 'Closed'");
-    }
-    if (opts.currentSprint) clauses.push("[System.IterationPath] = @CurrentIteration");
-    if (opts.state) clauses.push(`[System.State] = '${opts.state}'`);
-    if (opts.type) clauses.push(`[System.WorkItemType] = '${opts.type}'`);
-
-    const wiql = `SELECT [System.Id] FROM WorkItems WHERE ${clauses.join(" AND ")} ORDER BY [System.ChangedDate] DESC`;
-    const r = await this.queryWiql(wiql, opts.top ?? 30);
-    return this.listWorkItemsById(r.workItems.map((w) => w.id));
+    if (opts.ids) return this.listWorkItemsById(opts.ids, { fields: LIST_FIELDS });
+    const ids = await this.queryWiqlIds(this.buildListWiql(opts));
+    return this.listWorkItemsById(ids.slice(0, opts.top ?? 30), { fields: LIST_FIELDS });
   }
 
   // ── Comments ───────────────────────────────────────────────────────────────
@@ -822,17 +968,27 @@ export class AzureDevOpsClient {
     Array<{
       rev: number;
       revisedDate: string;
-      fields: Record<string, { oldValue: unknown; newValue: unknown }>;
+      revisedBy?: { displayName: string };
+      fields: Record<string, { oldValue?: unknown; newValue?: unknown }>;
     }>
   > {
+    // The "updates" endpoint returns per-revision field diffs (old→new),
+    // which is what a change history should show — far smaller than full
+    // "revisions" snapshots.
     const res = await this.get<{
       value: Array<{
         rev: number;
         revisedDate: string;
-        fields: Record<string, { oldValue: unknown; newValue: unknown }>;
+        revisedBy?: { displayName: string };
+        fields?: Record<string, { oldValue?: unknown; newValue?: unknown }>;
       }>;
-    }>(this.apis(`wit/workitems/${id}/revisions?api-version=7.1`));
-    return res.value;
+    }>(this.apis(`wit/workitems/${id}/updates?api-version=7.1`));
+    return res.value.map((u) => ({
+      rev: u.rev,
+      revisedDate: u.revisedDate,
+      revisedBy: u.revisedBy,
+      fields: u.fields ?? {},
+    }));
   }
 
   // ── Links ──────────────────────────────────────────────────────────────────
@@ -901,20 +1057,8 @@ export class AzureDevOpsClient {
     assignedTo?: string;
     top?: number;
   }): Promise<WorkItem[]> {
-    const clauses: string[] = [
-      `[System.TeamProject] = '${this.cfg.project}'`,
-      `([System.Title] CONTAINS '${opts.keyword}' OR [System.Description] CONTAINS '${opts.keyword}')`,
-    ];
-    if (opts.type) clauses.push(`[System.WorkItemType] = '${opts.type}'`);
-    if (opts.state) clauses.push(`[System.State] = '${opts.state}'`);
-    if (opts.assignedTo)
-      clauses.push(`[System.AssignedTo] = '${opts.assignedTo}'`);
-
-    const r = await this.queryWiql(
-      `SELECT [System.Id] FROM WorkItems WHERE ${clauses.join(" AND ")} ORDER BY [System.ChangedDate] DESC`,
-      opts.top ?? 50,
-    );
-    return this.listWorkItemsById(r.workItems.map((w) => w.id));
+    const ids = await this.queryWiqlIds(this.buildSearchWiql(opts));
+    return this.listWorkItemsById(ids.slice(0, opts.top ?? 50), { fields: LIST_FIELDS });
   }
 
   async listRecentWorkItems(type?: string, top = 30): Promise<WorkItem[]> {
@@ -1161,14 +1305,16 @@ export class AzureDevOpsClient {
     repoId: string,
     branch?: string,
     top = 20,
+    skip = 0,
   ): Promise<GitCommit[]> {
-    const branchFilter = branch
-      ? `&searchCriteria.itemVersion.version=${encodeURIComponent(branch)}`
-      : "";
+    const p = new URLSearchParams({
+      "api-version": "7.1",
+      "searchCriteria.$top": String(top),
+    });
+    if (skip > 0) p.set("searchCriteria.$skip", String(skip));
+    if (branch) p.set("searchCriteria.itemVersion.version", branch);
     const res = await this.get<{ value: GitCommit[] }>(
-      this.apis(
-        `git/repositories/${repoId}/commits?$top=${top}${branchFilter}&api-version=7.1`,
-      ),
+      this.apis(`git/repositories/${repoId}/commits?${p.toString()}`),
     );
     return res.value;
   }
@@ -1176,11 +1322,17 @@ export class AzureDevOpsClient {
   async listPullRequests(
     repoId: string,
     status: "active" | "completed" | "abandoned" | "all" = "active",
+    top = 20,
+    skip = 0,
   ): Promise<PullRequest[]> {
+    const p = new URLSearchParams({
+      "api-version": "7.1",
+      "searchCriteria.status": status,
+      "$top": String(top),
+    });
+    if (skip > 0) p.set("$skip", String(skip));
     const res = await this.get<{ value: PullRequest[] }>(
-      this.apis(
-        `git/repositories/${repoId}/pullrequests?searchCriteria.status=${status}&api-version=7.1`,
-      ),
+      this.apis(`git/repositories/${repoId}/pullrequests?${p.toString()}`),
     );
     return res.value;
   }
@@ -1232,7 +1384,7 @@ export class AzureDevOpsClient {
       "$format": "text",
     });
     if (branch) p.set("versionDescriptor.version", branch);
-    const res = await fetch(this.apis(`git/repositories/${repoId}/items?${p}`), {
+    const res = await this.request(this.apis(`git/repositories/${repoId}/items?${p}`), {
       headers: { ...this.headers, Accept: "text/plain" },
     });
     if (!res.ok) throw new Error(`GET file "${path}" → ${res.status}: ${await res.text()}`);
@@ -1313,7 +1465,7 @@ export class AzureDevOpsClient {
   }
 
   async getBuildLogContent(buildId: number, logId: number): Promise<string> {
-    const res = await fetch(
+    const res = await this.request(
       this.apis(`build/builds/${buildId}/logs/${logId}?api-version=7.1`),
       {
         headers: { ...this.headers, Accept: "text/plain" },
